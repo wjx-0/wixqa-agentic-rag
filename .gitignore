@@ -2,6 +2,7 @@ data/raw/
 data/processed/
 data/stats/
 outputs/
+indexes/
 **/__pycache__/
 **pycache**/
 .cache/

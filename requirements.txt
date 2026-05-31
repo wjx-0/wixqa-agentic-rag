@@ -6,3 +6,7 @@ orjson
 rich
 rank-bm25
 transformers==5.9.0
+torch
+sentence-transformers
+faiss-cpu
+numpy

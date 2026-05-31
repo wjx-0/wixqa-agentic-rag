@@ -2,16 +2,17 @@
 
 面向企业客服知识库，后续实现证据补全式 Agentic RAG。
 
-当前阶段：**数据接入、数据统计、BM25 article-level baseline、BM25 chunk-level baseline**。
+当前阶段：**数据接入、数据统计、BM25 baseline、Dense FAISS baseline**。
 
-当前仓库已经完成从 Hugging Face 加载 WixQA 基准数据集、转换为项目统一 JSONL 格式、生成数据统计结果，并实现两类 lexical retrieval baseline：
+当前仓库已经完成从 Hugging Face 加载 WixQA 基准数据集、转换为项目统一 JSONL 格式、生成数据统计结果，并实现三类 retrieval baseline：
 
 ```text
 article-level BM25
 chunk-level BM25
+dense FAISS over BAAI/bge-m3 chunks
 ```
 
-本阶段仍不实现 Dense Retrieval、RRF、Reranker、LLM 调用、答案生成或 Agent 循环。
+本阶段仍不实现 BM25 + Dense 融合、RRF、Reranker、LLM 调用、答案生成或 Agent 循环。
 
 ## 数据集
 
@@ -54,6 +55,8 @@ wixqa-agentic-rag/
 │   ├── retrievers/
 │   │   ├── bm25_retriever.py
 │   │   ├── chunk_bm25_retriever.py
+│   │   ├── dense_faiss_retriever.py
+│   │   ├── faiss_store.py
 │   │   └── tokenizer.py
 │   ├── utils/
 │   │   ├── io_utils.py
@@ -62,19 +65,25 @@ wixqa-agentic-rag/
 │       ├── data_stats.py
 │       ├── retrieval_metrics.py
 │       ├── run_bm25_eval.py
-│       └── run_chunk_bm25_eval.py
+│       ├── run_chunk_bm25_eval.py
+│       └── run_dense_faiss_eval.py
 ├── scripts/
+│   ├── build_faiss_index.py
 │   ├── compare_chunk_methods.py
 │   ├── download_wixqa.py
 │   ├── prepare_wixqa.py
 │   ├── prepare_chunks.py
 │   ├── inspect_wixqa.py
 │   ├── run_bm25_baseline.py
-│   └── run_chunk_bm25_baseline.py
+│   ├── run_chunk_bm25_baseline.py
+│   └── run_dense_faiss_baseline.py
+├── indexes/
+│   └── faiss_bge_m3/
 └── outputs/
     ├── data_inspection/
     ├── bm25_baseline/
-    └── chunk_bm25_baseline/
+    ├── chunk_bm25_baseline/
+    └── dense_faiss_baseline/
 ```
 
 ## 安装
@@ -158,6 +167,31 @@ python scripts/compare_chunk_methods.py \
   --output_path outputs/chunk_bm25_baseline/compare_chunk_methods.md
 ```
 
+构建 Dense FAISS index：
+
+```bash
+python scripts/build_faiss_index.py \
+  --processed_dir data/processed \
+  --chunks_path data/processed/wix_kb_chunks.jsonl \
+  --index_dir indexes/faiss_bge_m3 \
+  --model_name BAAI/bge-m3 \
+  --local_files_only true \
+  --batch_size 16
+```
+
+运行 Dense FAISS retrieval baseline：
+
+```bash
+python scripts/run_dense_faiss_baseline.py \
+  --processed_dir data/processed \
+  --index_dir indexes/faiss_bge_m3 \
+  --dataset wixqa_expertwritten \
+  --model_name BAAI/bge-m3 \
+  --local_files_only true \
+  --top_k_chunks 100 \
+  --top_k_articles 30
+```
+
 如果 Hugging Face 暂时不可访问，请在网络恢复后重试相同命令。`prepare_chunks.py` 会加载 `BAAI/bge-m3` tokenizer；离线复现时可先缓存 tokenizer，再使用 `--local_files_only`。
 
 ## 输出文件
@@ -222,6 +256,25 @@ outputs/chunk_bm25_baseline/<dataset>_cases_C_top30_not_full.jsonl
 outputs/chunk_bm25_baseline/compare_chunk_methods.md
 ```
 
+Dense FAISS index 输出：
+
+```text
+indexes/faiss_bge_m3/faiss.index
+indexes/faiss_bge_m3/chunk_metadata.jsonl
+indexes/faiss_bge_m3/index_config.json
+```
+
+Dense FAISS baseline 输出：
+
+```text
+outputs/dense_faiss_baseline/dense_bge-m3_<dataset>_metrics.json
+outputs/dense_faiss_baseline/dense_bge-m3_<dataset>_metrics.md
+outputs/dense_faiss_baseline/dense_bge-m3_<dataset>_retrieval_traces.jsonl
+outputs/dense_faiss_baseline/dense_bge-m3_<dataset>_cases_A_top10_full.jsonl
+outputs/dense_faiss_baseline/dense_bge-m3_<dataset>_cases_B_top30_full_not_top10.jsonl
+outputs/dense_faiss_baseline/dense_bge-m3_<dataset>_cases_C_top30_not_full.jsonl
+```
+
 ## 数据格式
 
 `KBArticle`:
@@ -252,9 +305,9 @@ metadata.chunk_tokenizer = BAAI/bge-m3
 
 如果原始数据没有 `qid`，`prepare_wixqa.py` 会生成稳定 ID，例如 `expertwritten_000001`。
 
-## Phase 2: BM25 Retrieval Baselines
+## Phase 2-3: Retrieval Baselines
 
-当前实现两类 BM25 检索基线。
+当前实现 BM25 与 Dense FAISS 检索基线。
 
 Article-level BM25：
 
@@ -274,6 +327,17 @@ BM25 检索 chunk
 
 注意：chunk 边界使用 `BAAI/bge-m3` tokenizer，是为了后续 Dense / Hybrid Retrieval 复用同一套 chunks。BM25 打分本身仍然是 lexical BM25。
 
+Dense FAISS：
+
+```text
+复用 data/processed/wix_kb_chunks.jsonl
+使用 BAAI/bge-m3 编码 chunk.text
+normalize embeddings = true
+FAISS index type = IndexFlatIP
+检索 top 100 chunks
+按 article_id 聚合为 top 30 articles
+```
+
 评测仍然是 article-level，因为 WixQA 的 gold labels 是 `article_ids`。
 
 当前指标包括：
@@ -286,7 +350,7 @@ article_precision@k
 MRR
 ```
 
-Chunk-level BM25 的 case 文件按 top30 口径划分：
+Chunk-level BM25 与 Dense FAISS 的 case 文件按 top30 口径划分：
 
 ```text
 A_top10_full              -> top10 已包含全部 gold articles
@@ -294,7 +358,7 @@ B_top30_full_not_top10    -> top30 包含全部 gold articles，但 top10 未包
 C_top30_not_full          -> top30 仍未包含全部 gold articles
 ```
 
-本阶段不实现 Dense Retrieval、RRF、Reranker、LLM 或 Agentic RAG；这些能力会在后续阶段加入。
+本阶段不实现 BM25 + Dense 融合、RRF、Reranker、LLM 或 Agentic RAG；这些能力会在后续阶段加入。
 
 ## 后续路线图
 
@@ -302,7 +366,7 @@ C_top30_not_full          -> top30 仍未包含全部 gold articles
 阶段 1：数据接入与统计
 阶段 2：BM25 Article-level Retrieval Baseline
 阶段 3：BM25 Chunk-level Retrieval Baseline
-阶段 4：Dense Retrieval Baseline
+阶段 4：Dense FAISS Retrieval Baseline
 阶段 5：Hybrid Retrieval with RRF Fusion
 阶段 6：Cross-Encoder Reranker
 阶段 7：Error Analysis & Trace Logging
