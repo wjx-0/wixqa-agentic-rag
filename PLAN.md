@@ -91,49 +91,56 @@ len(article_ids) >= 2
 
 ## 3. 核心评测指标
 
-本项目采用 article-level retrieval evaluation。
+本项目当前采用 chunk-ranked retrieval evaluation。
 
-每个 QA 样本有 gold `article_ids`，系统检索出的 top-k articles 与 gold article_ids 对比。
+每个 QA 样本有 gold `article_ids`。WixQA 没有 gold chunk IDs，因此系统保留 top-k chunks 原始排名，并使用每个 chunk 的 `article_id` 与 gold `article_ids` 对比。
 
-### 3.1 article_hit@k
+### 3.1 chunk_hit@k
 
-top-k 中是否命中任意一个 gold article：
+top-k chunks 中是否存在来自任意 gold article 的 chunk：
 
 ```text
-article_hit@k = 1 if retrieved_top_k contains at least one gold article else 0
+chunk_hit@k = 1 if retrieved_top_k_chunks contains at least one gold article_id else 0
 ```
 
-### 3.2 article_full_hit@k
+### 3.2 chunk_full_article_hit@k
 
-top-k 中是否包含全部 gold articles：
+top-k chunks 是否覆盖全部 gold articles：
 
 ```text
-article_full_hit@k = 1 if all gold article_ids are included in retrieved_top_k else 0
+chunk_full_article_hit@k = 1 if all gold article_ids are covered by retrieved_top_k_chunks else 0
 ```
 
 这是本项目最核心的指标。
 
-### 3.3 article_recall@k
+### 3.3 chunk_article_recall@k
 
-top-k 覆盖了多少 gold articles：
+top-k chunks 覆盖了多少 gold articles：
 
 ```text
-article_recall@k = number of retrieved gold articles / number of gold articles
+chunk_article_recall@k = number of covered gold articles / number of gold articles
 ```
 
-### 3.4 article_precision@k
+### 3.4 chunk_gold_rate@k
 
-top-k 中 gold articles 的比例：
+top-k chunks 中来自 gold articles 的比例：
 
 ```text
-article_precision@k = number of retrieved gold articles / k
+chunk_gold_rate@k = number of gold-article chunks / k
 ```
 
 ### 3.5 MRR
 
-第一个 gold article 出现在检索结果中的 reciprocal rank。
+第一个来自 gold article 的 chunk 出现在检索结果中的 reciprocal rank。
 
-### 3.6 Agentic RAG 额外指标
+### 3.6 候选多样性
+
+```text
+unique_articles@k_chunks = top-k chunks 覆盖的不同 article_id 数量
+duplicate_article_ratio@k_chunks = 1 - unique_articles / 实际返回 chunk 数量
+```
+
+### 3.7 Agentic RAG 额外指标
 
 后续 Agentic RAG 阶段还需要记录：
 
@@ -249,11 +256,11 @@ gold article_id 在 KB 中的覆盖率
 
 ---
 
-# Phase 2: BM25 Article-level Retrieval Baseline
+# Phase 2: BM25 Chunk-level Retrieval Baseline
 
 ## 目标
 
-实现最小可用的 BM25 article-level retrieval baseline。
+实现最小可用的 BM25 chunk-level retrieval baseline。
 
 当前阶段只做 BM25，不做 Dense、RRF、Reranker、LLM、Agentic RAG。
 
@@ -261,69 +268,68 @@ gold article_id 在 KB 中的覆盖率
 
 ```text
 Question
-  -> BM25 over Wix KB articles
-  -> Top-k article_ids
+  -> BM25 over Wix KB chunks
+  -> Top-k chunks
   -> Compare with gold article_ids
   -> Compute retrieval metrics
 ```
 
 ## 检索粒度
 
-当前阶段使用 article-level retrieval。
+当前阶段使用 chunk-level retrieval。
 
 即：
 
 ```text
-每一篇 Wix KB article 作为一个检索单元。
+使用 BAAI/bge-m3 tokenizer 生成的 chunk 作为检索单元。
 ```
 
 检索文本：
 
 ```text
-title + "\n" + contents
+chunk.text
 ```
 
 ## 需要实现
 
 ```text
 src/retrievers/tokenizer.py
-src/retrievers/bm25_retriever.py
-src/evaluation/retrieval_metrics.py
-src/evaluation/run_bm25_eval.py
-scripts/run_bm25_baseline.py
+src/retrievers/chunk_bm25_retriever.py
+src/evaluation/run_chunk_bm25_eval.py
+scripts/run_chunk_bm25_baseline.py
 ```
 
 ## 输出
 
 ```text
-outputs/bm25_baseline/wixqa_expertwritten_metrics.json
-outputs/bm25_baseline/wixqa_expertwritten_metrics.md
-outputs/bm25_baseline/wixqa_expertwritten_retrieval_traces.jsonl
+outputs/chunk_bm25_baseline/wixqa_expertwritten_metrics.json
+outputs/chunk_bm25_baseline/wixqa_expertwritten_metrics.md
+outputs/chunk_bm25_baseline/wixqa_expertwritten_retrieval_traces.jsonl
 
-outputs/bm25_baseline/wixqa_expertwritten_cases_A_top10_full.jsonl
-outputs/bm25_baseline/wixqa_expertwritten_cases_B_top50_full_not_top10.jsonl
-outputs/bm25_baseline/wixqa_expertwritten_cases_C_top50_not_full.jsonl
+outputs/chunk_bm25_baseline/wixqa_expertwritten_cases_A_top10_chunks_full.jsonl
+outputs/chunk_bm25_baseline/wixqa_expertwritten_cases_B_top100_chunks_full_not_top10_chunks.jsonl
+outputs/chunk_bm25_baseline/wixqa_expertwritten_cases_C_top100_chunks_not_full.jsonl
 ```
 
 ## Case 分类
 
 ```text
-A_top10_full:
-top10 已经包含全部 gold article_ids
+A_top10_chunks_full:
+top10 chunks 已经覆盖全部 gold article_ids
 
-B_top50_full_not_top10:
-top50 包含全部 gold article_ids，但 top10 没有
+B_top100_chunks_full_not_top10_chunks:
+top100 chunks 覆盖全部 gold article_ids，但 top10 chunks 没有
 
-C_top50_not_full:
-top50 仍然没有包含全部 gold article_ids
+C_top100_chunks_not_full:
+top100 chunks 仍然没有覆盖全部 gold article_ids
 ```
 
 ## 运行命令
 
 ```bash
-python scripts/run_bm25_baseline.py --dataset wixqa_expertwritten --top_k 50
-python scripts/run_bm25_baseline.py --dataset wixqa_simulated --top_k 50
-python scripts/run_bm25_baseline.py --dataset wixqa_synthetic --top_k 50
+python scripts/run_chunk_bm25_baseline.py --dataset wixqa_expertwritten --top_k_chunks 100
+python scripts/run_chunk_bm25_baseline.py --dataset wixqa_simulated --top_k_chunks 100
+python scripts/run_chunk_bm25_baseline.py --dataset wixqa_synthetic --top_k_chunks 100
 ```
 
 ## 验收标准
@@ -331,20 +337,20 @@ python scripts/run_bm25_baseline.py --dataset wixqa_synthetic --top_k 50
 能够得到 BM25 baseline 指标：
 
 ```text
-article_hit@5 / @10 / @20 / @50
-article_full_hit@5 / @10 / @20 / @50
-article_recall@5 / @10 / @20 / @50
-article_precision@5 / @10 / @20 / @50
+chunk_hit@5 / @10 / @20 / @100
+chunk_full_article_hit@5 / @10 / @20 / @100
+chunk_article_recall@5 / @10 / @20 / @100
+chunk_gold_rate@5 / @10 / @20 / @100
 mrr
 ```
 
 并单独统计：
 
 ```text
-single_article_article_full_hit@10
-multi_article_article_full_hit@10
-single_article_article_recall@10
-multi_article_article_recall@10
+single_chunk_full_article_hit@10
+multi_chunk_full_article_hit@10
+single_chunk_article_recall@10
+multi_chunk_article_recall@10
 ```
 
 ---
@@ -362,34 +368,31 @@ multi_article_article_recall@10
 ```text
 Question
   -> Dense Embedding
-  -> Vector Search over article embeddings
-  -> Top-k article_ids
-  -> Article-level Evaluation
+  -> FAISS Vector Search over BAAI/bge-m3 chunk embeddings
+  -> Top-k chunks
+  -> Chunk-level Evaluation with gold article_ids
 ```
 
 ## 推荐模型
 
-优先使用轻量 embedding 模型，例如：
+复用 chunk tokenizer 对应的 embedding 模型：
 
 ```text
-BAAI/bge-small-en-v1.5
-sentence-transformers/all-MiniLM-L6-v2
+BAAI/bge-m3
 ```
-
-如果服务器显存或 CPU 有限制，先使用小模型。
 
 ## 需要实现
 
 ```text
-src/retrievers/dense_retriever.py
-scripts/build_dense_index.py
-scripts/run_dense_baseline.py
+src/retrievers/faiss_store.py
+scripts/build_faiss_index.py
+scripts/run_dense_faiss_baseline.py
 ```
 
 ## 输出
 
 ```text
-outputs/dense_baseline/
+outputs/dense_faiss_baseline/
 ```
 
 ## 验收标准
@@ -398,10 +401,10 @@ outputs/dense_baseline/
 
 需要输出表格：
 
-| Method | article_full_hit@5 | article_full_hit@10 | article_recall@10 | MRR |
-| ------ | -----------------: | ------------------: | ----------------: | --: |
-| BM25   |                  x |                   x |                 x |   x |
-| Dense  |                  x |                   x |                 x |   x |
+| Method | chunk_full_article_hit@5 | chunk_full_article_hit@10 | chunk_article_recall@10 | MRR |
+| ------ | -----------------------: | ------------------------: | ----------------------: | --: |
+| BM25   |                        x |                         x |                       x |   x |
+| Dense  |                        x |                         x |                       x |   x |
 
 ---
 
@@ -409,29 +412,33 @@ outputs/dense_baseline/
 
 ## 目标
 
-实现 BM25 + Dense 的融合检索，建立强 retrieval baseline。
+实现 Chunk BM25 + Dense FAISS 的融合检索，建立强 chunk-level retrieval baseline。
 
 ## Pipeline
 
 ```text
-Question
-  -> BM25 top-k
-  -> Dense top-k
+Question batch
+  -> Chunk BM25 top-k chunks
+  -> Long-lived Dense worker top-k chunks
   -> RRF Fusion
-  -> Top-k article_ids
-  -> Article-level Evaluation
+  -> Top-k chunks
+  -> Chunk-level Evaluation with gold article_ids
 ```
 
 ## RRF 公式
 
 ```text
-score(doc) = sum(1 / (k + rank_i(doc)))
+score(chunk) = sum(weight_i / (k + rank_i(chunk)))
 ```
 
 默认：
 
 ```text
 k = 60
+按 chunk_id 融合
+BM25 与 Dense 权重默认均为 1.0，可通过 CLI 显式调整
+快速实验：50 + 50 -> 50
+标准诊断：100 + 100 -> 100
 ```
 
 ## 需要实现
@@ -439,26 +446,31 @@ k = 60
 ```text
 src/retrievers/hybrid_retriever.py
 src/retrievers/rrf.py
-scripts/run_hybrid_baseline.py
+src/retrievers/dense_worker.py
+src/evaluation/run_hybrid_rrf_eval.py
+scripts/run_hybrid_rrf_baseline.py
 ```
 
 ## 输出
 
 ```text
-outputs/hybrid_baseline/
+outputs/hybrid_rrf_baseline/
+└── hybrid_rrf_b{branch}_f{fused}_k{rrf_k}_bw{bm25_weight}_dw{dense_weight}_{dataset}/
 ```
 
 ## 验收标准
 
 和 BM25 / Dense 进行对比：
 
-| Method             | article_full_hit@5 | article_full_hit@10 | article_recall@10 | MRR |
-| ------------------ | -----------------: | ------------------: | ----------------: | --: |
-| BM25               |                  x |                   x |                 x |   x |
-| Dense              |                  x |                   x |                 x |   x |
-| BM25 + Dense + RRF |                  x |                   x |                 x |   x |
+| Method             | chunk_full_article_hit@10 | chunk_recall@10 | unique_articles@k_chunks | duplicate_article_ratio@k_chunks | MRR |
+| ------------------ | ------------------------: | --------------: | -----------------------: | -------------------------------: | --: |
+| Chunk BM25         |                         x |               x |                        x |                                x |   x |
+| Dense FAISS        |                         x |               x |                        x |                                x |   x |
+| BM25 + Dense + RRF |                         x |               x |                        x |                                x |   x |
 
-如果 Hybrid 没有提升，需要输出 error analysis，判断 BM25 和 Dense 各自召回了哪些不同 gold articles。
+Dense worker 启动一次并接收 query batch。默认 `full` 模式在 worker 内加载 SentenceTransformer 与 FAISS；若本机库冲突，显式切换 `model_only` 兼容模式。
+
+互补分析记录 gold article 在三种方法中的首次 chunk rank、单路独有命中、Hybrid top10 救回以及 top50 / top100 保留情况。
 
 ---
 
@@ -473,10 +485,10 @@ outputs/hybrid_baseline/
 ```text
 Question
   -> BM25 + Dense + RRF
-  -> Candidate articles top50 / top100
+  -> Candidate chunks top50 / top100
   -> Cross-Encoder Reranker
-  -> Final top-k articles
-  -> Article-level Evaluation
+  -> Final top-k chunks
+  -> Chunk-level Evaluation with gold article_ids
 ```
 
 ## 推荐 reranker
@@ -1001,7 +1013,7 @@ score(question, article_a, article_b)
 
 ```text
 Phase 1: 数据接入与统计分析
-Phase 2: BM25 Article-level Retrieval Baseline
+Phase 2: BM25 Chunk-level Retrieval Baseline
 Phase 3: Dense Retrieval Baseline
 Phase 4: Hybrid Retrieval with RRF
 Phase 5: Cross-Encoder Reranker
@@ -1073,19 +1085,19 @@ MVP
 
 ```text
 Phase 1: Data ingestion and dataset statistics
+Phase 2: BM25 Chunk-level Retrieval Baseline
+Phase 3: Dense Retrieval Baseline
 ```
 
 ## In Progress
 
 ```text
-Phase 2: BM25 Article-level Retrieval Baseline
+Phase 4: Hybrid Retrieval with RRF
 ```
 
 ## Planned
 
 ```text
-Phase 3: Dense Retrieval Baseline
-Phase 4: Hybrid Retrieval with RRF
 Phase 5: Cross-Encoder Reranker
 Phase 6: Error Analysis & Trace Logging
 Phase 7: Rule-based Second-hop Retrieval

@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
 
 from rich.console import Console
 
-from src.evaluation.run_bm25_eval import BM25EvalError, VALID_QA_DATASETS
+from src.evaluation.eval_utils import BM25EvalError, VALID_QA_DATASETS
 from src.evaluation.run_dense_faiss_eval import DenseFaissEvalError, run_dense_faiss_eval
 from src.retrievers.dense_faiss_retriever import DEFAULT_DENSE_MODEL_NAME
 
@@ -36,7 +36,6 @@ def main() -> int:
     parser.add_argument("--model_name", default=DEFAULT_DENSE_MODEL_NAME)
     parser.add_argument("--local_files_only", type=parse_bool, default=True)
     parser.add_argument("--top_k_chunks", type=int, default=100)
-    parser.add_argument("--top_k_articles", type=int, default=30)
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
@@ -50,7 +49,6 @@ def main() -> int:
             model_name=args.model_name,
             local_files_only=args.local_files_only,
             top_k_chunks=args.top_k_chunks,
-            top_k_articles=args.top_k_articles,
             device=args.device,
             console=console,
         )

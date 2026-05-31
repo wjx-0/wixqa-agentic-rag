@@ -1,2 +1,1 @@
-"""Article-level retrieval baselines."""
-
+"""Retrieval baselines."""
