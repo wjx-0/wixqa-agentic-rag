@@ -474,44 +474,60 @@ Dense worker 启动一次并接收 query batch。默认 `full` 模式在 worker 
 
 ---
 
-# Phase 5: Cross-Encoder Reranker
+# Phase 5: Qwen3 Chunk Reranker Baseline
 
 ## 目标
 
-在 Hybrid Retrieval 的候选池上加入 Cross-Encoder Reranker，建立强基线。
+在 Hybrid Retrieval 的候选池上加入本地 Qwen3 Reranker，建立强基线。
 
 ## Pipeline
 
 ```text
-Question
-  -> BM25 + Dense + RRF
-  -> Candidate chunks top50 / top100
-  -> Cross-Encoder Reranker
+Saved Hybrid candidates top50 / top100
+  -> Qwen/Qwen3-Reranker-0.6B
   -> Final top-k chunks
   -> Chunk-level Evaluation with gold article_ids
 ```
 
-## 推荐 reranker
+Reranker 读取 Hybrid 运行目录中的 `candidates.jsonl`，不会重新执行 BM25、Dense 编码或 FAISS 搜索。
+
+## 默认配置
 
 ```text
-BAAI/bge-reranker-base
-BAAI/bge-reranker-large
-cross-encoder/ms-marco-MiniLM-L-6-v2
+model_name = Qwen/Qwen3-Reranker-0.6B
+local_files_only = true
+rerank_batch_size = 8
+max_length = 1024
+instruction_name = wixqa_help_center_v1
 ```
 
-先用小模型，保证能快速跑通。
+默认 instruction：
+
+```text
+Given a Wix Help Center question, retrieve relevant passages that contain the information needed to answer the question.
+```
 
 ## 需要实现
 
 ```text
 src/rerankers/cross_encoder_reranker.py
+src/evaluation/run_rerank_eval.py
 scripts/run_rerank_baseline.py
+```
+
+Hybrid baseline 每次运行额外保存：
+
+```text
+candidates.jsonl
+comparison.json
 ```
 
 ## 输出
 
 ```text
 outputs/rerank_baseline/
+└── <hybrid_run_name>/
+    └── qwen3-reranker-0p6b_inst-wixqa_help_center_v1_ml1024/
 ```
 
 ## 重点诊断
@@ -519,15 +535,19 @@ outputs/rerank_baseline/
 需要比较：
 
 ```text
-before_rerank_article_full_hit@50
-after_rerank_article_full_hit@10
-after_rerank_article_full_hit@20
+source_candidate_full_article_hit
+chunk_full_article_hit@10
+chunk_full_article_hit@20
+rerank_top10_rescued_gold_article_ids
+rerank_top10_dropped_gold_article_ids
+gold_article_first_chunk_rank_before_rerank
+gold_article_first_chunk_rank_after_rerank
 ```
 
 如果：
 
 ```text
-before_rerank@50 高，但 after_rerank@10 低
+source candidate full hit 高，但 chunk_full_article_hit@10 低
 ```
 
 说明 reranker 把部分关键 evidence 排掉了，后续需要 coverage-aware selection。
@@ -536,12 +556,12 @@ before_rerank@50 高，但 after_rerank@10 低
 
 形成强 baseline 表格：
 
-| Method                | full_hit@5 | full_hit@10 | full_hit@20 | recall@10 | MRR |
-| --------------------- | ---------: | ----------: | ----------: | --------: | --: |
-| BM25                  |          x |           x |           x |         x |   x |
-| Dense                 |          x |           x |           x |         x |   x |
-| Hybrid RRF            |          x |           x |           x |         x |   x |
-| Hybrid RRF + Reranker |          x |           x |           x |         x |   x |
+| Method                       | chunk_full_article_hit@5 | chunk_full_article_hit@10 | chunk_full_article_hit@20 | chunk_article_recall@10 | MRR |
+| ---------------------------- | -----------------------: | ------------------------: | ------------------------: | ----------------------: | --: |
+| Chunk BM25                   |                        x |                         x |                         x |                       x |   x |
+| Dense FAISS                  |                        x |                         x |                         x |                       x |   x |
+| Hybrid RRF                   |                        x |                         x |                         x |                       x |   x |
+| Hybrid RRF + Qwen3 Reranker  |                        x |                         x |                         x |                       x |   x |
 
 ---
 
@@ -1016,7 +1036,7 @@ Phase 1: 数据接入与统计分析
 Phase 2: BM25 Chunk-level Retrieval Baseline
 Phase 3: Dense Retrieval Baseline
 Phase 4: Hybrid Retrieval with RRF
-Phase 5: Cross-Encoder Reranker
+Phase 5: Qwen3 Chunk Reranker Baseline
 Phase 6: Error Analysis & Trace Logging
 Phase 7: Rule-based Second-hop Retrieval
 Phase 8: Coverage-aware Selection
@@ -1098,7 +1118,7 @@ Phase 4: Hybrid Retrieval with RRF
 ## Planned
 
 ```text
-Phase 5: Cross-Encoder Reranker
+Phase 5: Qwen3 Chunk Reranker Baseline
 Phase 6: Error Analysis & Trace Logging
 Phase 7: Rule-based Second-hop Retrieval
 Phase 8: Coverage-aware Selection

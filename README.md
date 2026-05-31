@@ -2,17 +2,18 @@
 
 面向企业客服知识库，后续实现证据补全式 Agentic RAG。
 
-当前阶段：**Hybrid Retrieval with RRF Fusion**。
+当前阶段：**Qwen3 Chunk Reranker Baseline**。
 
-当前仓库已经完成数据接入、数据统计，并实现三类 chunk-level retrieval baseline：
+当前仓库已经完成数据接入、数据统计，并实现三类 chunk-level retrieval baseline 与 Qwen3 重排基线：
 
 ```text
 chunk-level BM25
 dense FAISS over BAAI/bge-m3 chunks
 hybrid BM25 + Dense with RRF
+Qwen/Qwen3-Reranker-0.6B over saved Hybrid chunks
 ```
 
-本阶段仍不实现 Reranker、LLM 调用、答案生成或 Agent 循环。
+本阶段仍不实现 LLM 调用、答案生成或 Agent 循环。
 
 ## 数据集
 
@@ -61,6 +62,8 @@ wixqa-agentic-rag/
 │   │   ├── hybrid_retriever.py
 │   │   ├── rrf.py
 │   │   └── tokenizer.py
+│   ├── rerankers/
+│   │   └── cross_encoder_reranker.py
 │   ├── utils/
 │   │   ├── io_utils.py
 │   │   └── text_utils.py
@@ -70,7 +73,8 @@ wixqa-agentic-rag/
 │       ├── eval_utils.py
 │       ├── run_chunk_bm25_eval.py
 │       ├── run_dense_faiss_eval.py
-│       └── run_hybrid_rrf_eval.py
+│       ├── run_hybrid_rrf_eval.py
+│       └── run_rerank_eval.py
 ├── scripts/
 │   ├── build_faiss_index.py
 │   ├── download_wixqa.py
@@ -79,14 +83,16 @@ wixqa-agentic-rag/
 │   ├── inspect_wixqa.py
 │   ├── run_chunk_bm25_baseline.py
 │   ├── run_dense_faiss_baseline.py
-│   └── run_hybrid_rrf_baseline.py
+│   ├── run_hybrid_rrf_baseline.py
+│   └── run_rerank_baseline.py
 ├── indexes/
 │   └── faiss_bge_m3/
 └── outputs/
     ├── data_inspection/
     ├── chunk_bm25_baseline/
     ├── dense_faiss_baseline/
-    └── hybrid_rrf_baseline/
+    ├── hybrid_rrf_baseline/
+    └── rerank_baseline/
 ```
 
 ## 安装
@@ -199,6 +205,39 @@ python scripts/run_hybrid_rrf_baseline.py \
 
 标准诊断配置将两个 top-k 参数改为 `100`。如果本机在同一进程加载 SentenceTransformer 与 FAISS 时崩溃，显式使用 `--dense_worker_mode model_only`。
 
+生成当前推荐的 Reranker 主实验候选池：
+
+```bash
+python scripts/run_hybrid_rrf_baseline.py \
+  --processed_dir data/processed \
+  --chunks_path data/processed/wix_kb_chunks.jsonl \
+  --index_dir indexes/faiss_bge_m3 \
+  --dataset wixqa_expertwritten \
+  --model_name BAAI/bge-m3 \
+  --local_files_only true \
+  --branch_top_k_chunks 100 \
+  --fused_top_k_chunks 50 \
+  --rrf_k 70 \
+  --bm25_weight 1.0 \
+  --dense_weight 2.5 \
+  --dense_worker_mode model_only \
+  --dense_query_batch_size 16
+```
+
+使用本地 Qwen3 模型重排保存的 Hybrid top50 chunks：
+
+```bash
+python scripts/run_rerank_baseline.py \
+  --hybrid_run_dir outputs/hybrid_rrf_baseline/hybrid_rrf_b100_f50_k70_bw1_dw2p5_wixqa_expertwritten \
+  --chunks_path data/processed/wix_kb_chunks.jsonl \
+  --model_name Qwen/Qwen3-Reranker-0.6B \
+  --local_files_only true \
+  --rerank_batch_size 8 \
+  --max_length 1024
+```
+
+Reranker 只读取保存的 Hybrid 候选池与 chunks，不会重新执行 BM25、Dense 编码或 FAISS 搜索。服务器 GPU 可额外传入 `--device cuda`。
+
 ## 输出文件
 
 处理后的 JSONL：
@@ -277,11 +316,27 @@ outputs/hybrid_rrf_baseline/
     ├── metrics.md
     ├── retrieval_traces.jsonl
     ├── comparison.md
+    ├── comparison.json
+    ├── candidates.jsonl
     ├── complementarity_analysis.jsonl
     └── cases_*.jsonl
 ```
 
 每次运行使用独立子目录。标准诊断配置使用 `hybrid_rrf_b100_f100_k60_bw1_dw2_<dataset>/`。`bw` 和 `dw` 分别记录 BM25 与 Dense 权重，避免不同实验互相覆盖。
+
+Qwen3 Reranker baseline 输出：
+
+```text
+outputs/rerank_baseline/
+└── <hybrid_run_name>/
+    └── qwen3-reranker-0p6b_inst-wixqa_help_center_v1_ml1024/
+        ├── run_config.json
+        ├── metrics.json
+        ├── metrics.md
+        ├── comparison.md
+        ├── rerank_traces.jsonl
+        └── cases_*.jsonl
+```
 
 ## 数据格式
 
@@ -313,7 +368,7 @@ metadata.chunk_tokenizer = BAAI/bge-m3
 
 如果原始数据没有 `qid`，`prepare_wixqa.py` 会生成稳定 ID，例如 `expertwritten_000001`。
 
-## Phase 2-4: Retrieval Baselines
+## Phase 2-5: Retrieval And Reranker Baselines
 
 当前实现 Chunk BM25、Dense FAISS 与 Hybrid RRF 检索基线。
 
@@ -355,6 +410,22 @@ rrf_score(chunk) = sum(weight_i / (60 + rank_i(chunk)))
 
 Hybrid 使用常驻 Dense worker。默认 `full` 模式在 worker 内加载 SentenceTransformer 与 FAISS index；`model_only` 兼容模式只在 worker 内编码 query，由主进程执行 FAISS 搜索。
 
+Qwen3 Reranker：
+
+```text
+复用 Hybrid candidates.jsonl，不重复执行检索
+使用 Qwen/Qwen3-Reranker-0.6B
+输入为 (question, chunk.text)
+按 rerank_score 降序重排 chunks
+仍然使用 chunk.article_id 对 gold article_ids 评测
+```
+
+默认使用 Wix Help Center 专用 instruction：
+
+```text
+Given a Wix Help Center question, retrieve relevant passages that contain the information needed to answer the question.
+```
+
 三类 baseline 指标包括：
 
 ```text
@@ -377,7 +448,7 @@ B_top{cutoff}_chunks_full_not_top10_chunks  -> top cutoff chunks 覆盖全部 go
 C_top{cutoff}_chunks_not_full               -> top cutoff chunks 仍未覆盖全部 gold article_ids
 ```
 
-本阶段不实现 Reranker、LLM 或 Agentic RAG；这些能力会在后续阶段加入。
+本阶段不实现 LLM 或 Agentic RAG；这些能力会在后续阶段加入。
 
 ## 后续路线图
 
@@ -386,7 +457,7 @@ C_top{cutoff}_chunks_not_full               -> top cutoff chunks 仍未覆盖全
 阶段 2：BM25 Chunk-level Retrieval Baseline
 阶段 3：Dense FAISS Retrieval Baseline
 阶段 4：Hybrid Retrieval with RRF Fusion
-阶段 5：Cross-Encoder Reranker
+阶段 5：Qwen3 Chunk Reranker Baseline
 阶段 6：Error Analysis & Trace Logging
 阶段 7：Rule-based Second-hop Retrieval
 阶段 8：证据充分性检查器与有边界的 Agentic RAG 循环

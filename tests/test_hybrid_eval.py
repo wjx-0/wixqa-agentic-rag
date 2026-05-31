@@ -4,6 +4,8 @@ import unittest
 
 from src.evaluation.run_hybrid_rrf_eval import (
     HybridRRFEvalError,
+    build_candidate_row,
+    build_comparison_payload,
     build_run_name,
     build_complementarity_row,
     validate_args,
@@ -99,6 +101,54 @@ class HybridEvalTest(unittest.TestCase):
         )
 
         self.assertEqual(row["hybrid_top100_retained_gold_article_ids"], ["gold"])
+
+    def test_candidate_row_keeps_complete_hybrid_pool(self) -> None:
+        class Example:
+            qid = "qid"
+            dataset_name = "wixqa_expertwritten"
+            question = "question"
+            answer = "answer"
+            article_ids = ["gold"]
+            num_gold_articles = 1
+            is_multi_article = False
+
+        row = build_candidate_row(
+            Example(),
+            [
+                {
+                    **result("chunk", "gold", 1),
+                    "rrf_score": 0.1,
+                    "bm25_rank": 2,
+                    "dense_rank": 1,
+                    "bm25_score": 3.0,
+                    "dense_score": 0.8,
+                    "sources": ["bm25", "dense"],
+                }
+            ],
+            fused_top_k_chunks=50,
+        )
+
+        self.assertEqual(row["fused_top_k_chunks"], 50)
+        self.assertEqual(row["hybrid_candidates"][0]["chunk_id"], "chunk")
+        self.assertEqual(row["hybrid_candidates"][0]["sources"], ["bm25", "dense"])
+
+    def test_comparison_payload_keeps_three_method_summaries(self) -> None:
+        summary = {
+            "dataset_name": "wixqa_expertwritten",
+            "branch_top_k_chunks": 100,
+            "fused_top_k_chunks": 50,
+            "rrf_k": 70,
+            "bm25_weight": 1.0,
+            "dense_weight": 2.5,
+        }
+        payload = build_comparison_payload(
+            run_name="hybrid_run",
+            hybrid_summary=summary,
+            summaries={"bm25": {}, "dense": {}, "hybrid": summary},
+        )
+
+        self.assertEqual(payload["source_run_name"], "hybrid_run")
+        self.assertEqual(set(payload["methods"]), {"bm25", "dense", "hybrid"})
 
 
 if __name__ == "__main__":

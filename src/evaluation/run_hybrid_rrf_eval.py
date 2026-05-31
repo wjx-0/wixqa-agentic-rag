@@ -104,6 +104,7 @@ def run_hybrid_rrf_eval(
     method_rows: dict[str, list[dict[str, Any]]] = {"bm25": [], "dense": [], "hybrid": []}
     traces = []
     complementarity_rows = []
+    candidate_rows = []
 
     for example, results in zip(qa_examples, result_batches):
         method_metrics = {
@@ -147,6 +148,13 @@ def run_hybrid_rrf_eval(
                 example.qid,
                 example.article_ids,
                 results,
+                fused_top_k_chunks=fused_top_k_chunks,
+            )
+        )
+        candidate_rows.append(
+            build_candidate_row(
+                example,
+                results["hybrid"],
                 fused_top_k_chunks=fused_top_k_chunks,
             )
         )
@@ -225,6 +233,15 @@ def run_hybrid_rrf_eval(
     write_jsonl(
         run_dir / "complementarity_analysis.jsonl",
         complementarity_rows,
+    )
+    write_jsonl(run_dir / "candidates.jsonl", candidate_rows)
+    write_json(
+        run_dir / "comparison.json",
+        build_comparison_payload(
+            run_name=run_name,
+            hybrid_summary=summary,
+            summaries=summaries,
+        ),
     )
     (run_dir / "comparison.md").write_text(
         render_comparison_markdown(summary, summaries),
@@ -352,8 +369,58 @@ def gold_article_first_chunk_rank(
     return ranks
 
 
+def build_candidate_row(
+    example: Any,
+    hybrid_results: list[dict[str, Any]],
+    *,
+    fused_top_k_chunks: int,
+) -> dict[str, Any]:
+    return {
+        "qid": example.qid,
+        "dataset_name": example.dataset_name,
+        "question": example.question,
+        "answer": example.answer,
+        "gold_article_ids": example.article_ids,
+        "num_gold_articles": example.num_gold_articles,
+        "is_multi_article": example.is_multi_article,
+        "fused_top_k_chunks": fused_top_k_chunks,
+        "hybrid_candidates": [
+            {
+                "rank": result["rank"],
+                "chunk_id": result["chunk_id"],
+                "article_id": result["article_id"],
+                "rrf_score": result["rrf_score"],
+                "bm25_rank": result.get("bm25_rank"),
+                "dense_rank": result.get("dense_rank"),
+                "bm25_score": result.get("bm25_score"),
+                "dense_score": result.get("dense_score"),
+                "sources": result["sources"],
+            }
+            for result in hybrid_results
+        ],
+    }
+
+
 def chunk_ids(results: list[dict[str, Any]]) -> list[str]:
     return [result["chunk_id"] for result in results if result.get("chunk_id")]
+
+
+def build_comparison_payload(
+    *,
+    run_name: str,
+    hybrid_summary: dict[str, Any],
+    summaries: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "source_run_name": run_name,
+        "dataset_name": hybrid_summary["dataset_name"],
+        "branch_top_k_chunks": hybrid_summary["branch_top_k_chunks"],
+        "fused_top_k_chunks": hybrid_summary["fused_top_k_chunks"],
+        "rrf_k": hybrid_summary["rrf_k"],
+        "bm25_weight": hybrid_summary["bm25_weight"],
+        "dense_weight": hybrid_summary["dense_weight"],
+        "methods": summaries,
+    }
 
 
 def render_hybrid_metrics_markdown(
