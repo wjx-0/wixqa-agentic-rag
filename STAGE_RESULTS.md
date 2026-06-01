@@ -258,6 +258,52 @@ instruction_name = wixqa_help_center_v1
 - 单文章问题已经比较强。
 - 多文章问题仍然是主要瓶颈。单 chunk reranker 倾向判断单个 chunk 的相关性，不天然保证证据集合覆盖完整。
 
+## Stage 6: Error Analysis And Trace Logging
+
+Phase 6 将 reranker top50 trace 拆分为：
+
+| Case | Count | Ratio | Next Step |
+| --- | ---: | ---: | --- |
+| A: top10 chunks full | 160 | 0.8000 | done |
+| B: top50 chunks full but top10 chunks not full | 19 | 0.0950 | diagnosis only |
+| C: top50 chunks not full | 21 | 0.1050 | Phase 7 second-hop retrieval |
+
+Multi-article 问题中，B 类有 `9` 条，C 类有 `14` 条。Phase 7 优先验证能否通过额外检索补齐 C 类缺失文章，不单独增加 Coverage Selection 阶段。
+
+## Stage 7: Rule-based Second-hop Retrieval
+
+已实现 title-expanded second-hop retrieval：
+
+```text
+baseline reranker top10 chunks
+-> 选取前 3 个不同 article titles
+-> 构造 question + title 扩展查询
+-> 每条查询执行 Hybrid top20
+-> 与首轮 Hybrid top50 按 chunk_id 合并
+-> 使用原始问题重新运行 Qwen3 reranker
+```
+
+本阶段同时记录：
+
+```text
+C_pool_rescued_count  = 原 top50 不完整，但合并候选池已覆盖全部 gold articles
+C_top10_rescued_count = 原 top50 不完整，且最终 rerank top10 已覆盖全部 gold articles
+A_dropped_count       = baseline top10 原本完整，但 second-hop 后不再完整
+```
+
+公平 top100 Hybrid control 已生成，仅将主线 fused cutoff 从 `50` 调整为 `100`：
+
+| Metric | Top50 Hybrid | Top100 Hybrid Control |
+| --- | ---: | ---: |
+| full@10 | 0.7050 | 0.7050 |
+| recall@10 | 0.7625 | 0.7625 |
+| full@50 | 0.8950 | 0.8950 |
+| recall@50 | 0.9250 | 0.9250 |
+| full@100 | - | 0.9350 |
+| recall@100 | - | 0.9550 |
+
+当前工作区没有可用 CUDA 或 MPS。CPU 可以生成 Hybrid control，但 top100 Qwen reranker 运行耗时过长，因此 top100 reranker 与 Phase 7 真实结果留待 GPU 环境补跑。
+
 ## Current Conclusion
 
 当前最清晰的阶段收益链条是：
@@ -282,8 +328,7 @@ recall@50 = 0.9250
 
 ## Recommended Next Steps
 
-1. 对 `k80, bw1, dw2` 和 `k80, bw1, dw3` 的 Hybrid 候选池也跑 reranker，对比 top10 是否继续提升。
-2. 跑 top100 reranker 诊断，确认扩大候选池是否能减少 `C_top50_chunks_not_full` 类型问题。
-3. 针对多文章问题实现 coverage-aware selection，避免 reranker 只把同一篇文章的多个 chunks 排到前面。
+1. 在 GPU 环境跑公平 top100 Qwen reranker control。
+2. 运行 `scripts/run_rule_second_hop.py --device cuda`，记录 pool rescue、top10 rescue 与 A dropped。
+3. 根据 Phase 7 结果决定 Phase 8 checker 应优先增强 query generation 还是 reranker。
 4. 回头修复 `REVIEW_NOTES.md` 中记录的工程问题：动态 cutoff、MRR cutoff 口径、Hybrid artifacts 一致性校验。
-

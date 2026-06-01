@@ -287,7 +287,7 @@ def summarize_error_traces(
         "case_labels": {"A": case_a, "B": case_b, "C": case_c},
         "case_descriptions": {
             "A": "top10 chunks already cover all gold articles",
-            "B": f"top{top_k_chunks} chunks cover all gold articles but top10 chunks do not; target coverage-aware selection",
+            "B": f"top{top_k_chunks} chunks cover all gold articles but top10 chunks do not; keep for diagnosis without a dedicated selection stage",
             "C": f"top{top_k_chunks} chunks still miss at least one gold article; target second-hop retrieval",
         },
         "group_metrics": {
@@ -456,7 +456,7 @@ def render_error_summary_markdown(summary: dict[str, Any]) -> str:
                     case_b,
                     summary["case_B_count"],
                     f"{summary['case_B_ratio']:.4f}",
-                    "Phase 8 coverage-aware selection",
+                    "diagnosis only",
                 ],
                 [
                     case_c,

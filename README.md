@@ -2,15 +2,16 @@
 
 面向企业客服知识库，后续实现证据补全式 Agentic RAG。
 
-当前阶段：**Qwen3 Chunk Reranker Baseline**。
+当前阶段：**Rule-based Second-hop Retrieval**。
 
-当前仓库已经完成数据接入、数据统计，并实现三类 chunk-level retrieval baseline 与 Qwen3 重排基线：
+当前仓库已经完成数据接入、数据统计、三类 chunk-level retrieval baseline、Qwen3 重排基线、错误分析和无 LLM 的规则补检索：
 
 ```text
 chunk-level BM25
 dense FAISS over BAAI/bge-m3 chunks
 hybrid BM25 + Dense with RRF
 Qwen/Qwen3-Reranker-0.6B over saved Hybrid chunks
+rule-based title-expanded second-hop retrieval
 ```
 
 本阶段仍不实现 LLM 调用、答案生成或 Agent 循环。
@@ -61,6 +62,7 @@ wixqa-agentic-rag/
 │   │   ├── faiss_store.py
 │   │   ├── hybrid_retriever.py
 │   │   ├── rrf.py
+│   │   ├── rule_second_hop.py
 │   │   └── tokenizer.py
 │   ├── rerankers/
 │   │   └── cross_encoder_reranker.py
@@ -74,7 +76,9 @@ wixqa-agentic-rag/
 │       ├── run_chunk_bm25_eval.py
 │       ├── run_dense_faiss_eval.py
 │       ├── run_hybrid_rrf_eval.py
-│       └── run_rerank_eval.py
+│       ├── run_rerank_eval.py
+│       ├── run_error_analysis.py
+│       └── run_rule_second_hop_eval.py
 ├── scripts/
 │   ├── build_faiss_index.py
 │   ├── download_wixqa.py
@@ -84,7 +88,9 @@ wixqa-agentic-rag/
 │   ├── run_chunk_bm25_baseline.py
 │   ├── run_dense_faiss_baseline.py
 │   ├── run_hybrid_rrf_baseline.py
-│   └── run_rerank_baseline.py
+│   ├── run_rerank_baseline.py
+│   ├── run_error_analysis.py
+│   └── run_rule_second_hop.py
 ├── indexes/
 │   └── faiss_bge_m3/
 └── outputs/
@@ -92,7 +98,9 @@ wixqa-agentic-rag/
     ├── chunk_bm25_baseline/
     ├── dense_faiss_baseline/
     ├── hybrid_rrf_baseline/
-    └── rerank_baseline/
+    ├── rerank_baseline/
+    ├── error_analysis/
+    └── rule_second_hop/
 ```
 
 ## 安装
@@ -238,6 +246,36 @@ python scripts/run_rerank_baseline.py \
 
 Reranker 只读取保存的 Hybrid 候选池与 chunks，不会重新执行 BM25、Dense 编码或 FAISS 搜索。服务器 GPU 可额外传入 `--device cuda`。
 
+生成 Phase 6 错误分析：
+
+```bash
+python scripts/run_error_analysis.py
+```
+
+运行 Phase 7 title-expanded second-hop retrieval：
+
+```bash
+python scripts/run_rule_second_hop.py --device cuda
+```
+
+Phase 7 默认读取主线 top50 baseline 与公平的 top100 control。需要先生成 `hybrid_rrf_b100_f100_k60_bw1_dw2_wixqa_expertwritten` 及其 Qwen3 reranker artifact。
+
+```bash
+python scripts/run_hybrid_rrf_baseline.py \
+  --dataset wixqa_expertwritten \
+  --branch_top_k_chunks 100 \
+  --fused_top_k_chunks 100 \
+  --rrf_k 60 \
+  --bm25_weight 1 \
+  --dense_weight 2 \
+  --device cuda
+
+python scripts/run_rerank_baseline.py \
+  --hybrid_run_dir outputs/hybrid_rrf_baseline/hybrid_rrf_b100_f100_k60_bw1_dw2_wixqa_expertwritten \
+  --rerank_batch_size 32 \
+  --device cuda
+```
+
 ## 输出文件
 
 处理后的 JSONL：
@@ -336,6 +374,35 @@ outputs/rerank_baseline/
         ├── comparison.md
         ├── rerank_traces.jsonl
         └── cases_*.jsonl
+```
+
+Error analysis 输出：
+
+```text
+outputs/error_analysis/
+├── summary.json
+├── summary.md
+├── case_traces_top50_chunks.jsonl
+├── cases_A_top10_chunks_full.jsonl
+├── cases_B_top50_chunks_full_not_top10_chunks.jsonl
+├── cases_C_top50_chunks_not_full.jsonl
+├── multi_cases_B_top50_chunks_full_not_top10_chunks.jsonl
+└── multi_cases_C_top50_chunks_not_full.jsonl
+```
+
+Rule-based Second-hop Retrieval 输出：
+
+```text
+outputs/rule_second_hop/
+└── <hybrid_run_name>/
+    └── <reranker_run_name>/
+        └── title_expand_s3_h20/
+            ├── run_config.json
+            ├── metrics.json
+            ├── metrics.md
+            ├── comparison.md
+            ├── second_hop_traces.jsonl
+            └── cases_*.jsonl
 ```
 
 ## 数据格式
@@ -450,6 +517,19 @@ C_top{cutoff}_chunks_not_full               -> top cutoff chunks 仍未覆盖全
 
 本阶段不实现 LLM 或 Agentic RAG；这些能力会在后续阶段加入。
 
+Rule-based Second-hop Retrieval：
+
+```text
+baseline reranker top10 chunks
+  -> 按 article_id 去重，选取最多 3 个标题
+  -> 构造 question + title 扩展查询
+  -> 每条查询执行 Hybrid top20
+  -> 与首轮 Hybrid top50 按 chunk_id 合并
+  -> 使用原问题重新运行 Qwen3 reranker
+```
+
+Phase 7 对全部样本执行一次补检索。A/B/C 分类和 gold labels 只用于离线评测，不得用于触发 query、构造 query 或合并候选。`C_pool_rescued` 表示原 top50 缺证据但合并池已覆盖全部 gold articles；`C_top10_rescued` 表示重新 rerank 后 top10 已覆盖全部 gold articles。
+
 ## 后续路线图
 
 ```text
@@ -460,6 +540,9 @@ C_top{cutoff}_chunks_not_full               -> top cutoff chunks 仍未覆盖全
 阶段 5：Qwen3 Chunk Reranker Baseline
 阶段 6：Error Analysis & Trace Logging
 阶段 7：Rule-based Second-hop Retrieval
-阶段 8：证据充分性检查器与有边界的 Agentic RAG 循环
-阶段 9：带引用的答案生成
+阶段 8：LLM Evidence Sufficiency Checker
+阶段 9：Bounded Agentic RAG Loop
+阶段 10：Citation-aware Answer Generation
+阶段 11：Verifier / Abstention
+阶段 12：Optional Pairwise Evidence Reranker
 ```

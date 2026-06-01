@@ -47,7 +47,6 @@ Question
   -> Evidence Sufficiency Check
   -> Gap-aware Query Generation
   -> Second-hop Retrieval
-  -> Coverage-aware Selection
   -> Citation-aware Answer / Verifier
 ```
 
@@ -550,7 +549,7 @@ gold_article_first_chunk_rank_after_rerank
 source candidate full hit 高，但 chunk_full_article_hit@10 低
 ```
 
-说明 reranker 把部分关键 evidence 排掉了，后续需要 coverage-aware selection。
+说明 reranker 把部分关键 evidence 排掉了，需要保留为排序诊断信号。
 
 ## 验收标准
 
@@ -576,10 +575,13 @@ source candidate full hit 高，但 chunk_full_article_hit@10 低
 ```text
 outputs/error_analysis/
   summary.json
-  case_traces.jsonl
-  cases_A_top10_full.jsonl
-  cases_B_top50_full_not_top10.jsonl
-  cases_C_top50_not_full.jsonl
+  summary.md
+  case_traces_top50_chunks.jsonl
+  cases_A_top10_chunks_full.jsonl
+  cases_B_top50_chunks_full_not_top10_chunks.jsonl
+  cases_C_top50_chunks_not_full.jsonl
+  multi_cases_B_top50_chunks_full_not_top10_chunks.jsonl
+  multi_cases_C_top50_chunks_not_full.jsonl
 ```
 
 ## 每条 trace 包含
@@ -594,20 +596,30 @@ outputs/error_analysis/
   "num_gold_articles": 2,
   "is_multi_article": true,
 
-  "top10_article_ids": [],
-  "top50_article_ids": [],
-  "top10_titles": [],
-  "top50_titles": [],
+  "top10_chunks_article_ids": [],
+  "top50_chunks_article_ids": [],
+  "top10_chunks_titles": [],
+  "top50_chunks_titles": [],
 
-  "article_full_hit@10": 0,
-  "article_recall@10": 0.5,
+  "article_full_hit@10_chunks": 0,
+  "article_recall@10_chunks": 0.5,
+  "article_full_hit@50_chunks": 0,
+  "article_recall@50_chunks": 0.5,
 
-  "missing_articles_at_10": [],
-  "missing_articles_at_50": [],
+  "unique_articles@10_chunks": 8,
+  "duplicate_article_ratio@10_chunks": 0.2,
+  "unique_articles@50_chunks": 35,
+  "duplicate_article_ratio@50_chunks": 0.3,
 
-  "case_type": "B_top50_full_not_top10"
+  "missing_articles_at_10_chunks": [],
+  "missing_articles_at_50_chunks": [],
+  "gold_article_first_chunk_rank": {},
+
+  "case_type": "B_top50_chunks_full_not_top10_chunks"
 }
 ```
+
+其中 before / after rerank 诊断字段为 optional，源 trace 中存在时保留，缺失时不报错。
 
 ## 重点分析
 
@@ -625,10 +637,24 @@ synthetic
 尤其关注：
 
 ```text
-multi-article article_full_hit@10
+multi-article article_full_hit@10_chunks
 ```
 
 因为 Agentic RAG 主要应该提升多文档问题。
+
+根据 error analysis，优先处理候选池本身缺少证据的 C 类：
+
+```text
+B_top50_chunks_full_not_top10_chunks
+  -> 候选池已有完整证据
+  -> 暂不单独增加 selection 阶段
+
+C_top50_chunks_not_full
+  -> 候选池本身缺少证据
+  -> 使用 Phase 7 Rule-based Second-hop Retrieval
+```
+
+后续先实现 Phase 7 Rule-based Second-hop Retrieval，验证补检索能否提升 multi-article coverage。
 
 ---
 
@@ -638,9 +664,37 @@ multi-article article_full_hit@10
 
 先不调用 LLM，实现无 LLM 的 second-hop retrieval，用来验证“补检索”是否有效。
 
+```text
+C_top50_chunks_not_full
+```
+
+因为这些样本的现有 top50 chunks 候选池本身缺少 gold articles，仅依靠已有排序无法解决。
+
+本阶段不增加独立的 Coverage Selection。补检索后的候选池沿用现有 reranker 排序，先验证新增候选是否能补齐缺失 supporting articles。
+
+`C_top50_chunks_not_full` 只作为离线评测切片，不作为运行时触发条件。Phase 7 v1 默认对全部样本执行一次 rule-based second-hop；Phase 8 再引入 LLM checker 判断何时需要继续检索。
+
+query 构造和检索逻辑不得读取 `gold_article_ids`、`missing_articles_at_50_chunks` 或 `case_type`。gold labels 仅用于最终指标统计。
+
 ## 核心思路
 
-如果第一轮 top-k 只召回部分文章，则从已有 top articles 中抽取关键词、标题、URL path、功能名、相关短语，构造 second-hop queries，再次检索。
+固定使用 baseline reranker top10 chunks 中最先出现的 3 个不同 `article_id`，分别拼接文章标题构造 second-hop queries：
+
+```text
+seed source                   = baseline reranker top10 chunks
+seed dedup                    = article_id first-seen order
+max seed articles             = 3
+query template                = "{question} Related Wix Help Center topic: {title}"
+second-hop retriever          = Hybrid BM25 + Dense RRF
+branch_top_k_chunks           = 100
+second_hop_fused_top_k_chunks = 20 per query
+rrf_k                         = 60
+bm25_weight                   = 1
+dense_weight                  = 2
+merged candidate upper bound  = 50 + 3 * 20 = 110 chunks
+```
+
+合并时按 `chunk_id` 去重，首轮 top50 优先，再按 query 顺序和 second-hop rank 追加。最终使用原始问题重新运行同一 Qwen3 reranker。
 
 ## Pipeline
 
@@ -655,98 +709,58 @@ Question
   -> Evaluation
 ```
 
-## 可抽取信息
+## Rescue 定义
 
 ```text
-article title
-url path tokens
-headings
-capitalized phrases
-question keywords
-top article related terms
+G   = gold_article_ids
+P50 = 首轮 Hybrid top50 chunks 覆盖的 article_ids
+PM  = second-hop 合并候选池覆盖的 article_ids
+B10 = baseline Qwen3 reranker top10 chunks 覆盖的 article_ids
+F10 = 合并候选重新 rerank 后 top10 chunks 覆盖的 article_ids
+
+source_C = G 不是 P50 的子集
+source_A = G 是 B10 的子集
+
+C_pool_rescued  = source_C and G 是 PM 的子集
+C_top10_rescued = source_C and G 是 F10 的子集
+A_dropped       = source_A and G 不是 F10 的子集
 ```
+
+补回部分文章但仍未覆盖全部 gold articles 时，不计入 rescued。`C_top10_rescued = true` 必然意味着 `C_pool_rescued = true`。
 
 ## 输出
 
 ```text
 outputs/rule_second_hop/
+  <hybrid_run_name>/
+    <rerank_run_name>/
+      title_expand_s3_h20/
+        run_config.json
+        metrics.json
+        metrics.md
+        comparison.md
+        second_hop_traces.jsonl
+        cases_C_pool_rescued_by_second_hop.jsonl
+        cases_C_top10_rescued_by_second_hop.jsonl
+        multi_cases_C_top10_rescued_by_second_hop.jsonl
+        cases_A_dropped_by_second_hop.jsonl
 ```
 
 ## 验收标准
 
 对比：
 
-| Method                      | full_hit@10 | recall@10 | avg_retrieval_rounds |
-| --------------------------- | ----------: | --------: | -------------------: |
-| Hybrid + Reranker           |           x |         x |                  1.0 |
-| + Rule Second-hop Retrieval |           x |         x |                  2.0 |
+| Method                      | chunk_full_article_hit@10 | chunk_article_recall@10 | multi_chunk_full_article_hit@10 | C_pool_rescued_count | C_top10_rescued_count | A_dropped_count |
+| --------------------------- | ------------------------: | ----------------------: | ------------------------------: | -------------------: | --------------------: | --------------: |
+| Top50 Hybrid + Reranker     |                         x |                       x |                               x |                    - |                     - |               - |
+| Top100 Hybrid + Reranker    |                         x |                       x |                               x |                    - |                     - |               - |
+| + Rule Second-hop Retrieval |                         x |                       x |                               x |                    x |                     x |               x |
 
-如果 full_hit@10 在 multi-article subset 上有提升，则进入下一阶段。
-
----
-
-# Phase 8: Coverage-aware Evidence Selection
-
-## 目标
-
-最终 top10 不再简单取 reranker 前 10，而是优化证据集合覆盖率。
-
-## 问题
-
-普通 reranker 学习：
-
-```text
-score(question, article)
-```
-
-但多文档问题需要：
-
-```text
-which set of articles together supports the answer
-```
-
-## 简单策略
-
-从不同来源保留一定数量：
-
-```text
-original query results: top n
-second-hop query results: top n
-global reranker results: fill remaining slots
-```
-
-## Pipeline
-
-```text
-Candidate Pool
-  -> Group by source_stage
-  -> Select high-confidence original articles
-  -> Select high-confidence second-hop articles
-  -> Fill by global reranker
-  -> Final top-k
-```
-
-## 输出
-
-```text
-outputs/coverage_selection/
-```
-
-## 验收标准
-
-比较：
-
-| Method                     | full_hit@5 | full_hit@10 | recall@10 |
-| -------------------------- | ---------: | ----------: | --------: |
-| Hybrid + Reranker          |          x |           x |         x |
-| + Second-hop Retrieval     |          x |           x |         x |
-| + Coverage-aware Selection |          x |           x |         x |
-
-如果 top10 full_hit 提升，说明 evidence selection 有效。
+先补跑 `b100_f100_k60_bw1_dw2` 公平 top100 对照，只改变 fused cutoff。主指标为最终 `multi_chunk_full_article_hit@10`；同时报告 pool rescue 和 top10 rescue，区分 retrieval 与 reranker 问题。
 
 ---
 
-# Phase 9: LLM Evidence Sufficiency Checker
+# Phase 8: LLM Evidence Sufficiency Checker
 
 ## 目标
 
@@ -804,7 +818,7 @@ llm_calls
 
 ---
 
-# Phase 10: Bounded Agentic RAG Loop
+# Phase 9: Bounded Agentic RAG Loop
 
 ## 目标
 
@@ -823,7 +837,6 @@ Question
         Second-hop Retrieval
         Evidence Pool Merge
         Rerank
-  -> Coverage-aware Selection
   -> Final top-k articles
 ```
 
@@ -889,7 +902,7 @@ multi-article subset full_hit@10
 
 ---
 
-# Phase 11: Citation-aware Answer Generation
+# Phase 10: Citation-aware Answer Generation
 
 ## 目标
 
@@ -947,7 +960,7 @@ citation urls
 
 ---
 
-# Phase 12: Verifier / Abstention
+# Phase 11: Verifier / Abstention
 
 ## 目标
 
@@ -984,7 +997,7 @@ citation urls
 
 ---
 
-# Phase 13: Optional - Pairwise Evidence Reranker
+# Phase 12: Optional - Pairwise Evidence Reranker
 
 ## 目标
 
@@ -1039,8 +1052,8 @@ Phase 4: Hybrid Retrieval with RRF
 Phase 5: Qwen3 Chunk Reranker Baseline
 Phase 6: Error Analysis & Trace Logging
 Phase 7: Rule-based Second-hop Retrieval
-Phase 8: Coverage-aware Selection
-Phase 10: Bounded Agentic RAG Loop
+Phase 8: LLM Evidence Sufficiency Checker
+Phase 9: Bounded Agentic RAG Loop
 ```
 
 预计时间：
@@ -1055,9 +1068,8 @@ Phase 10: Bounded Agentic RAG Loop
 
 ```text
 MVP
-+ Phase 9: LLM Evidence Sufficiency Checker
-+ Phase 11: Citation-aware Answer Generation
-+ Phase 12: Verifier / Abstention
++ Phase 10: Citation-aware Answer Generation
++ Phase 11: Verifier / Abstention
 ```
 
 预计时间：
@@ -1072,7 +1084,7 @@ MVP
 
 ```text
 完整企业化版本
-+ Phase 13: Pairwise Evidence Reranker
++ Phase 12: Pairwise Evidence Reranker
 ```
 
 预计时间：
@@ -1088,7 +1100,7 @@ MVP
 完成后，简历可以写：
 
 ```text
-构建面向企业客服知识库的 Evidence-Completion Agentic RAG 系统，基于 WixQA 实现 BM25、Dense Retrieval、RRF Fusion、Cross-Encoder Reranker 等强检索基线，并针对多文档问题中支持文章召回不完整的问题，引入 Evidence Sufficiency Checker、Gap-aware Query Generation、Bounded Second-hop Retrieval 和 Coverage-aware Selection，以 article_full_hit@k、article_recall@k、avg_llm_calls 和 agent trace 评估检索完整性与系统成本。
+构建面向企业客服知识库的 Evidence-Completion Agentic RAG 系统，基于 WixQA 实现 BM25、Dense Retrieval、RRF Fusion、Cross-Encoder Reranker 等强检索基线，并针对多文档问题中支持文章召回不完整的问题，引入 Evidence Sufficiency Checker、Gap-aware Query Generation 和 Bounded Second-hop Retrieval，以 article_full_hit@k、article_recall@k、avg_llm_calls 和 agent trace 评估检索完整性与系统成本。
 ```
 
 如果最终加入答案生成，可以补充：
@@ -1107,24 +1119,24 @@ MVP
 Phase 1: Data ingestion and dataset statistics
 Phase 2: BM25 Chunk-level Retrieval Baseline
 Phase 3: Dense Retrieval Baseline
+Phase 4: Hybrid Retrieval with RRF
+Phase 5: Qwen3 Chunk Reranker Baseline
+Phase 6: Error Analysis & Trace Logging
+Phase 7: Rule-based Second-hop Retrieval implementation
 ```
 
-## In Progress
+## Next
 
 ```text
-Phase 4: Hybrid Retrieval with RRF
+Phase 7: GPU evaluation for Top100 control and title-expanded second-hop
 ```
 
 ## Planned
 
 ```text
-Phase 5: Qwen3 Chunk Reranker Baseline
-Phase 6: Error Analysis & Trace Logging
-Phase 7: Rule-based Second-hop Retrieval
-Phase 8: Coverage-aware Selection
-Phase 9: LLM Evidence Sufficiency Checker
-Phase 10: Bounded Agentic RAG Loop
-Phase 11: Citation-aware Answer Generation
-Phase 12: Verifier / Abstention
-Phase 13: Pairwise Evidence Reranker
+Phase 8: LLM Evidence Sufficiency Checker
+Phase 9: Bounded Agentic RAG Loop
+Phase 10: Citation-aware Answer Generation
+Phase 11: Verifier / Abstention
+Phase 12: Pairwise Evidence Reranker
 ```

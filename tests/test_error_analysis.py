@@ -226,7 +226,7 @@ class ErrorAnalysisTest(unittest.TestCase):
             saved_summary = read_json(output_dir / "summary.json")
             self.assertEqual(
                 saved_summary["case_descriptions"]["B"],
-                "top50 chunks cover all gold articles but top10 chunks do not; target coverage-aware selection",
+                "top50 chunks cover all gold articles but top10 chunks do not; keep for diagnosis without a dedicated selection stage",
             )
             self.assertIn("Phase 7 second-hop retrieval", (output_dir / "summary.md").read_text())
 
