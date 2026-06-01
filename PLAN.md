@@ -760,61 +760,128 @@ outputs/rule_second_hop/
 
 ---
 
-# Phase 8: LLM Evidence Sufficiency Checker
+# Phase 8: LLM Evidence Sufficiency Checker + Pool-level Gap Query Eval
 
 ## 目标
 
-引入真正的 Agentic RAG 能力：让 LLM 判断当前证据是否足够、缺什么、下一步应该检索什么。
+在 Phase 7 标题扩展规则收益有限后，引入 LLM checker 判断 baseline reranker top10 证据是否充足，并生成面向缺失证据的 gap-aware queries。
 
-注意：LLM 不直接回答问题，只负责证据诊断和 query generation。
+Phase 8 v1 是 **pool-level eval**：只评估 LLM queries 是否能把缺失 gold articles 补进合并候选池；本阶段不重新 rerank merged pool，不报告最终 top10 context quality。
 
-## 输入
+## 默认运行
+
+```bash
+python scripts/run_llm_evidence_checker.py \
+  --device cuda \
+  --llm_base_url <openai-compatible-url> \
+  --llm_api_key <key> \
+  --llm_model <server-qwen3-8b-model-name>
+```
+
+默认使用当前 top50 Hybrid + Qwen3 reranker baseline、top100 control、Phase 7 rule second-hop 结果、FAISS index 和 chunks。
+
+## Checker 输入输出
+
+输入：
 
 ```text
 question
-top retrieved articles
+baseline reranker top10 chunks
 ```
 
-## 输出 JSON
+只给 LLM `rank/title/article_id/text_preview`，不提供 `gold_article_ids`、`case_type`、`missing_articles`。
+
+输出 JSON：
 
 ```json
 {
   "sufficient": false,
   "known_facts": [],
   "missing_evidence": [],
-  "next_queries": []
+  "next_queries": [],
+  "reason": ""
 }
 ```
 
-## Prompt 约束
+Prompt 强约束：
 
 ```text
-1. Do not answer the question.
-2. Only judge whether retrieved articles contain enough evidence.
-3. next_queries must contain concrete entities or product/function names.
-4. Do not use pronouns like "it", "this", "that feature".
-5. Generate at most 3 next_queries.
-6. Return valid JSON only.
+1. Do not answer the user's question.
+2. Only judge whether retrieved chunks contain enough evidence.
+3. missing_evidence must describe the concrete missing evidence.
+4. next_queries must target missing_evidence, not merely rewrite the original question.
+5. next_queries must contain concrete Wix product, feature, action, setting, integration, error, or entity names.
+6. Do not use vague pronouns like it, this, that feature, or that setting.
+7. Generate at most 3 next_queries.
+8. Return valid JSON only.
 ```
 
-## 输出
+## Pool-level Eval
+
+```text
+checker insufficient + next_queries
+  -> Hybrid BM25 + Dense RRF per query
+  -> second_hop_fused_top_k_chunks = 20
+  -> merge with first-hop Hybrid top50 by chunk_id
+  -> evaluate merged pool article coverage
+```
+
+固定参数：
+
+```text
+max_next_queries = 3
+branch_top_k_chunks = 100
+second_hop_fused_top_k_chunks = 20
+rrf_k = 60
+bm25_weight = 1
+dense_weight = 2
+```
+
+输出：
 
 ```text
 outputs/llm_evidence_checker/
+  hybrid_rrf_b100_f50_k60_bw1_dw2_wixqa_expertwritten/
+    qwen3-reranker-0p6b_inst-wixqa_help_center_v1_ml1024/
+      qwen3_8b_s3_h20_pool_eval/
+        run_config.json
+        metrics.json
+        metrics.md
+        comparison.md
+        checker_traces.jsonl
+        cases_invalid_checker_json.jsonl
+        cases_checker_insufficient.jsonl
+        cases_C_pool_rescued_by_llm_checker.jsonl
+        multi_cases_C_pool_rescued_by_llm_checker.jsonl
+        cases_source_C_checker_sufficient_miss.jsonl
 ```
 
-## 验收标准
-
-能够记录：
+核心指标：
 
 ```text
-checker_sufficient
-missing_evidence
-next_queries
-llm_calls
+checker_valid_count
+invalid_json_count
+checker_sufficient_count
+checker_insufficient_count
+source_C_insufficient_rate
+source_C_checker_sufficient_count
+LLM_C_pool_rescued_count
+multi_LLM_C_pool_rescued_count
+pool_new_gold_articles_count
+multi_pool_new_gold_articles_count
+avg_llm_calls
+avg_generated_queries
+avg_second_hop_queries
+avg_merged_candidates
 ```
 
-并验证 LLM 生成的 next_queries 能带来新的 relevant articles。
+判断标准：
+
+```text
+LLM_C_pool_rescued_count > Phase 7 C_pool_rescued_count = 3
+multi_LLM_C_pool_rescued_count > Phase 7 multi_C_pool_rescued_count = 1
+source_C_checker_sufficient_count 越低越好
+```
 
 ---
 
@@ -1123,18 +1190,18 @@ Phase 4: Hybrid Retrieval with RRF
 Phase 5: Qwen3 Chunk Reranker Baseline
 Phase 6: Error Analysis & Trace Logging
 Phase 7: Rule-based Second-hop Retrieval implementation
+Phase 8: LLM Evidence Checker pool-level eval implementation
 ```
 
 ## Next
 
 ```text
-Phase 7: GPU evaluation for Top100 control and title-expanded second-hop
+Phase 8: Server run with Qwen3 8B OpenAI-compatible endpoint
 ```
 
 ## Planned
 
 ```text
-Phase 8: LLM Evidence Sufficiency Checker
 Phase 9: Bounded Agentic RAG Loop
 Phase 10: Citation-aware Answer Generation
 Phase 11: Verifier / Abstention

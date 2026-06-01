@@ -2,9 +2,9 @@
 
 面向企业客服知识库，后续实现证据补全式 Agentic RAG。
 
-当前阶段：**Rule-based Second-hop Retrieval**。
+当前阶段：**LLM Evidence Sufficiency Checker pool-level eval**。
 
-当前仓库已经完成数据接入、数据统计、三类 chunk-level retrieval baseline、Qwen3 重排基线、错误分析和无 LLM 的规则补检索：
+当前仓库已经完成数据接入、数据统计、三类 chunk-level retrieval baseline、Qwen3 重排基线、错误分析、无 LLM 的规则补检索和 LLM checker 评测代码：
 
 ```text
 chunk-level BM25
@@ -12,9 +12,10 @@ dense FAISS over BAAI/bge-m3 chunks
 hybrid BM25 + Dense with RRF
 Qwen/Qwen3-Reranker-0.6B over saved Hybrid chunks
 rule-based title-expanded second-hop retrieval
+LLM evidence sufficiency checker + gap-query pool eval
 ```
 
-本阶段仍不实现 LLM 调用、答案生成或 Agent 循环。
+Phase 8 只做 pool-level eval：LLM 生成 gap queries 后检查合并候选池覆盖，不做最终 merged-pool rerank、答案生成或 Agent 循环。
 
 ## 数据集
 
@@ -66,6 +67,8 @@ wixqa-agentic-rag/
 │   │   └── tokenizer.py
 │   ├── rerankers/
 │   │   └── cross_encoder_reranker.py
+│   ├── llm/
+│   │   └── evidence_checker.py
 │   ├── utils/
 │   │   ├── io_utils.py
 │   │   └── text_utils.py
@@ -78,7 +81,8 @@ wixqa-agentic-rag/
 │       ├── run_hybrid_rrf_eval.py
 │       ├── run_rerank_eval.py
 │       ├── run_error_analysis.py
-│       └── run_rule_second_hop_eval.py
+│       ├── run_rule_second_hop_eval.py
+│       └── run_llm_evidence_checker_eval.py
 ├── scripts/
 │   ├── build_faiss_index.py
 │   ├── download_wixqa.py
@@ -90,7 +94,8 @@ wixqa-agentic-rag/
 │   ├── run_hybrid_rrf_baseline.py
 │   ├── run_rerank_baseline.py
 │   ├── run_error_analysis.py
-│   └── run_rule_second_hop.py
+│   ├── run_rule_second_hop.py
+│   └── run_llm_evidence_checker.py
 ├── indexes/
 │   └── faiss_bge_m3/
 └── outputs/
@@ -100,7 +105,8 @@ wixqa-agentic-rag/
     ├── hybrid_rrf_baseline/
     ├── rerank_baseline/
     ├── error_analysis/
-    └── rule_second_hop/
+    ├── rule_second_hop/
+    └── llm_evidence_checker/
 ```
 
 ## 安装
@@ -275,6 +281,18 @@ python scripts/run_rerank_baseline.py \
   --rerank_batch_size 32 \
   --device cuda
 ```
+
+运行 Phase 8 LLM evidence checker pool-level eval：
+
+```bash
+python scripts/run_llm_evidence_checker.py \
+  --device cuda \
+  --llm_base_url <openai-compatible-url> \
+  --llm_api_key <key> \
+  --llm_model <server-qwen3-8b-model-name>
+```
+
+Phase 8 默认读取主线 top50 baseline、公平 top100 control、Phase 7 rule second-hop 结果、FAISS index 和 chunks。该阶段只检查 LLM gap queries 是否补齐 merged pool，不重新 rerank merged pool。
 
 ## 输出文件
 
@@ -515,8 +533,6 @@ B_top{cutoff}_chunks_full_not_top10_chunks  -> top cutoff chunks 覆盖全部 go
 C_top{cutoff}_chunks_not_full               -> top cutoff chunks 仍未覆盖全部 gold article_ids
 ```
 
-本阶段不实现 LLM 或 Agentic RAG；这些能力会在后续阶段加入。
-
 Rule-based Second-hop Retrieval：
 
 ```text
@@ -529,6 +545,19 @@ baseline reranker top10 chunks
 ```
 
 Phase 7 对全部样本执行一次补检索。A/B/C 分类和 gold labels 只用于离线评测，不得用于触发 query、构造 query 或合并候选。`C_pool_rescued` 表示原 top50 缺证据但合并池已覆盖全部 gold articles；`C_top10_rescued` 表示重新 rerank 后 top10 已覆盖全部 gold articles。
+
+LLM Evidence Sufficiency Checker pool-level eval：
+
+```text
+baseline reranker top10 chunks
+  -> LLM 判断证据是否充足
+  -> insufficient 时生成最多 3 条 missing-evidence-oriented queries
+  -> 每条 query 执行 Hybrid top20
+  -> 与首轮 Hybrid top50 按 chunk_id 合并
+  -> 只评估 merged pool 是否覆盖缺失 gold articles
+```
+
+Phase 8 明确不是最终 rerank loop：`comparison.md` 中的 Phase 8 行只报告 pool rescue，不报告 final top10 context quality。Gold labels 只用于离线评测，不进入 prompt 或 query generation。
 
 ## 后续路线图
 

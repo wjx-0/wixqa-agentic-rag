@@ -302,7 +302,48 @@ A_dropped_count       = baseline top10 原本完整，但 second-hop 后不再�
 | full@100 | - | 0.9350 |
 | recall@100 | - | 0.9550 |
 
-当前工作区没有可用 CUDA 或 MPS。CPU 可以生成 Hybrid control，但 top100 Qwen reranker 运行耗时过长，因此 top100 reranker 与 Phase 7 真实结果留待 GPU 环境补跑。
+服务器 GPU 已补齐公平 top100 Qwen reranker control 和 Phase 7 title-expanded second-hop 真实结果：
+
+| Method | full@10 | recall@10 | multi full@10 | multi recall@10 |
+| --- | ---: | ---: | ---: | ---: |
+| Top50 Hybrid + Qwen3 baseline | 0.8000 | 0.8442 | 0.5577 | 0.7276 |
+| Top100 Hybrid + Qwen3 control | 0.7950 | 0.8442 | 0.5577 | 0.7468 |
+| Top50 + title-expanded second-hop + Qwen3 | 0.8050 | 0.8492 | 0.5385 | 0.7083 |
+
+Phase 7 rescue 诊断：
+
+| Metric | Value |
+| --- | ---: |
+| C_pool_rescued_count | 3 |
+| multi_C_pool_rescued_count | 1 |
+| C_top10_rescued_count | 2 |
+| multi_C_top10_rescued_count | 0 |
+| A_dropped_count | 1 |
+| avg_second_hop_queries | 3.0000 |
+| avg_merged_candidates | 59.8250 |
+
+结论：标题扩展规则可以补回少量 pool evidence，但没有救到 multi C 的最终 top10，且 multi full@10 下降。因此 Phase 8 转向 LLM checker 生成更针对 missing evidence 的 gap-aware queries。
+
+## Stage 8: LLM Evidence Sufficiency Checker Pool-level Eval
+
+已实现 Phase 8 代码，真实 Qwen3 8B 运行留给服务器：
+
+```text
+baseline reranker top10 chunks
+-> LLM checker 判断证据是否充足
+-> insufficient 时生成最多 3 条 missing-evidence-oriented queries
+-> 每条 query 执行 Hybrid top20
+-> 与首轮 Hybrid top50 合并
+-> 只评估 merged pool coverage
+```
+
+Phase 8 明确是 pool-level eval，不做最终 merged-pool rerank loop。主判断标准：
+
+```text
+LLM_C_pool_rescued_count > Phase 7 C_pool_rescued_count = 3
+multi_LLM_C_pool_rescued_count > Phase 7 multi_C_pool_rescued_count = 1
+source_C_checker_sufficient_count 越低越好
+```
 
 ## Current Conclusion
 
@@ -328,7 +369,7 @@ recall@50 = 0.9250
 
 ## Recommended Next Steps
 
-1. 在 GPU 环境跑公平 top100 Qwen reranker control。
-2. 运行 `scripts/run_rule_second_hop.py --device cuda`，记录 pool rescue、top10 rescue 与 A dropped。
-3. 根据 Phase 7 结果决定 Phase 8 checker 应优先增强 query generation 还是 reranker。
-4. 回头修复 `REVIEW_NOTES.md` 中记录的工程问题：动态 cutoff、MRR cutoff 口径、Hybrid artifacts 一致性校验。
+1. 在服务器启动 Qwen3 8B OpenAI-compatible endpoint。
+2. 运行 `scripts/run_llm_evidence_checker.py --device cuda --llm_base_url <url> --llm_model <model>`。
+3. 查看 `outputs/llm_evidence_checker/.../comparison.md`，重点比较 Phase 8 pool rescue 是否超过 Phase 7。
+4. 若 pool rescue 明显提升，Phase 9 再接 merged pool rerank loop；若 pool rescue 仍低，继续强化 checker prompt / query generation。
