@@ -2,7 +2,7 @@
 
 面向企业客服知识库，后续实现证据补全式 Agentic RAG。
 
-当前阶段：**LLM Evidence Sufficiency Checker pool-level eval**。
+当前阶段：**LLM gap-query merged-pool rerank loop**。
 
 当前仓库已经完成数据接入、数据统计、三类 chunk-level retrieval baseline、Qwen3 重排基线、错误分析、无 LLM 的规则补检索和 LLM checker 评测代码：
 
@@ -13,9 +13,11 @@ hybrid BM25 + Dense with RRF
 Qwen/Qwen3-Reranker-0.6B over saved Hybrid chunks
 rule-based title-expanded second-hop retrieval
 LLM evidence sufficiency checker + gap-query pool eval
+LLM gap-query merged pool + Qwen3 rerank eval
 ```
 
 Phase 8 只做 pool-level eval：LLM 生成 gap queries 后检查合并候选池覆盖，不做最终 merged-pool rerank、答案生成或 Agent 循环。
+Phase 9 复用 Phase 8 merged pool，不重新调用 LLM 或检索，只用 Qwen3 reranker 评估最终 top10，并额外输出 top20 诊断指标。
 
 ## 数据集
 
@@ -82,7 +84,8 @@ wixqa-agentic-rag/
 │       ├── run_rerank_eval.py
 │       ├── run_error_analysis.py
 │       ├── run_rule_second_hop_eval.py
-│       └── run_llm_evidence_checker_eval.py
+│       ├── run_llm_evidence_checker_eval.py
+│       └── run_agentic_rerank_eval.py
 ├── scripts/
 │   ├── build_faiss_index.py
 │   ├── download_wixqa.py
@@ -95,7 +98,8 @@ wixqa-agentic-rag/
 │   ├── run_rerank_baseline.py
 │   ├── run_error_analysis.py
 │   ├── run_rule_second_hop.py
-│   └── run_llm_evidence_checker.py
+│   ├── run_llm_evidence_checker.py
+│   └── run_agentic_rerank_loop.py
 ├── indexes/
 │   └── faiss_bge_m3/
 └── outputs/
@@ -106,7 +110,8 @@ wixqa-agentic-rag/
     ├── rerank_baseline/
     ├── error_analysis/
     ├── rule_second_hop/
-    └── llm_evidence_checker/
+    ├── llm_evidence_checker/
+    └── agentic_rag/
 ```
 
 ## 安装
@@ -293,6 +298,16 @@ python scripts/run_llm_evidence_checker.py \
 ```
 
 Phase 8 默认读取主线 top50 baseline、公平 top100 control、Phase 7 rule second-hop 结果、FAISS index 和 chunks。该阶段只检查 LLM gap queries 是否补齐 merged pool，不重新 rerank merged pool。
+
+运行 Phase 9 merged-pool rerank loop：
+
+```bash
+python scripts/run_agentic_rerank_loop.py \
+  --device cuda \
+  --dense_worker_mode model_only
+```
+
+Phase 9 默认读取 Phase 8 `checker_traces.jsonl`，重建 merged pool 后用 Qwen3 reranker 重新排序。该阶段不重新调用 LLM，也不重新执行 BM25 / Dense / FAISS 检索；top10 是主指标，top20 只作为诊断指标。
 
 ## 输出文件
 
@@ -570,7 +585,7 @@ Phase 8 明确不是最终 rerank loop：`comparison.md` 中的 Phase 8 行只�
 阶段 6：Error Analysis & Trace Logging
 阶段 7：Rule-based Second-hop Retrieval
 阶段 8：LLM Evidence Sufficiency Checker
-阶段 9：Bounded Agentic RAG Loop
+阶段 9：LLM Gap-query Merged Pool Rerank Loop
 阶段 10：Citation-aware Answer Generation
 阶段 11：Verifier / Abstention
 阶段 12：Optional Pairwise Evidence Reranker

@@ -885,86 +885,127 @@ source_C_checker_sufficient_count 越低越好
 
 ---
 
-# Phase 9: Bounded Agentic RAG Loop
+# Phase 9: LLM Gap-query Merged Pool Rerank Loop
 
 ## 目标
 
-实现完整的 Evidence-Completion Agentic RAG 检索循环。
+复用 Phase 8 的 LLM gap-query merged pool，不重新调用 LLM，也不重新执行 second-hop retrieval，只把合并候选池交给 Qwen3 reranker 重新排序，验证补进 pool 的证据是否能进入最终上下文。
+
+主指标仍然是 final top10；额外输出 final top20 作为诊断，判断证据是否只是排在 11-20 位。
 
 ## Pipeline
 
 ```text
-Question
-  -> Query Router
-  -> Hybrid Retrieval
-  -> Reranker
-  -> Evidence Sufficiency Checker
-  -> if insufficient:
-        Gap Query Generation
-        Second-hop Retrieval
-        Evidence Pool Merge
-        Rerank
-  -> Final top-k articles
+Phase 8 checker_traces.jsonl
+  -> first-hop top50 + second_hop_results 重建 merged pool
+  -> Qwen3 reranker 使用原始 question 重排 merged pool
+  -> final top10 主指标
+  -> final top20 诊断指标
 ```
 
-## 控制条件
-
-为了企业化和可控成本，需要设置：
+Phase 9 v1 明确不做：
 
 ```text
-max_rounds = 2
-max_queries_per_round = 3
-top_k_per_query = 20
-max_candidate_articles = 120
-stop if checker says sufficient
-stop if no new articles are retrieved
+no new LLM calls
+no new BM25 / Dense / FAISS retrieval
+no independent Coverage Selection
+no answer generation
 ```
 
-## Trace Logging
+## Metrics
 
-每条样本记录：
+严格定义：
 
-```json
-{
-  "qid": "string",
-  "question": "string",
-  "route": "single_article | multi_article | unknown",
-  "rounds": [
-    {
-      "round_id": 0,
-      "queries": [],
-      "retrieved_article_ids": [],
-      "checker_result": {}
-    }
-  ],
-  "final_article_ids": [],
-  "gold_article_ids": [],
-  "article_full_hit@10": 1,
-  "article_recall@10": 1.0,
-  "avg_llm_calls": 1,
-  "avg_retrieval_rounds": 2
-}
+```text
+G   = gold_article_ids
+P50 = first-hop top50 chunks 覆盖的 article_ids
+PM  = Phase 8 merged pool 覆盖的 article_ids
+B10 = baseline reranker top10 chunks 覆盖的 article_ids
+F10 = Phase 9 merged-pool rerank 后 top10 chunks 覆盖的 article_ids
+F20 = Phase 9 merged-pool rerank 后 top20 chunks 覆盖的 article_ids
+
+source_C = G 不是 P50 的子集
+source_A = G 是 B10 的子集
+
+LLM_C_pool_rescued  = source_C and G 是 PM 的子集
+LLM_C_top10_rescued = source_C and G 是 F10 的子集
+LLM_C_top20_rescued = source_C and G 是 F20 的子集
+
+A_dropped@10 = source_A and G 不是 F10 的子集
+A_dropped@20 = source_A and G 不是 F20 的子集
+
+pool_rescued_but_not_top10
+  = LLM_C_pool_rescued and not LLM_C_top10_rescued
+
+pool_rescued_but_top20_only
+  = LLM_C_pool_rescued and LLM_C_top20_rescued and not LLM_C_top10_rescued
+```
+
+逻辑约束：
+
+```text
+LLM_C_top10_rescued => LLM_C_top20_rescued => LLM_C_pool_rescued
 ```
 
 ## 输出
 
 ```text
 outputs/agentic_rag/
+  hybrid_rrf_b100_f50_k60_bw1_dw2_wixqa_expertwritten/
+    qwen3-reranker-0p6b_inst-wixqa_help_center_v1_ml1024/
+      qwen3_8b_s3_h20_pool_eval/
+        rerank_merged_pool/
+          run_config.json
+          metrics.json
+          metrics.md
+          comparison.md
+          agentic_rerank_traces.jsonl
+          cases_LLM_C_top10_rescued_by_rerank.jsonl
+          cases_LLM_C_top20_rescued_by_rerank.jsonl
+          multi_cases_LLM_C_top10_rescued_by_rerank.jsonl
+          multi_cases_LLM_C_top20_rescued_by_rerank.jsonl
+          cases_LLM_C_pool_rescued_but_not_top10.jsonl
+          cases_LLM_C_pool_rescued_but_top20_only.jsonl
+          cases_A_dropped_by_agentic_rerank.jsonl
 ```
+
+运行：
+
+```bash
+python scripts/run_agentic_rerank_loop.py \
+  --device cuda \
+  --dense_worker_mode model_only
+```
+
+`--dense_worker_mode` 仅为服务器命令兼容保留；Phase 9 不加载 Dense retriever。
 
 ## 验收标准
 
-对比强 baseline：
-
-| Method            | full_hit@10 | recall@10 | avg_llm_calls | avg_retrieval_rounds |
-| ----------------- | ----------: | --------: | ------------: | -------------------: |
-| Hybrid + Reranker |           x |         x |             0 |                    1 |
-| Agentic RAG       |           x |         x |             x |                    x |
+```text
+全部 200 条样本生成 agentic_rerank_traces.jsonl
+LLM_C_pool_rescued_count 复现 Phase 8 的 7
+top10 为主指标，top20 仅用于诊断
+```
 
 重点看：
 
 ```text
-multi-article subset full_hit@10
+multi_chunk_full_article_hit@10
+LLM_C_top10_rescued_count
+multi_LLM_C_top10_rescued_count
+A_dropped@10_count
+
+LLM_C_top20_rescued_count
+multi_LLM_C_top20_rescued_count
+pool_rescued_but_top20_only_count
+```
+
+判断：
+
+```text
+若 top20 rescue 明显高于 top10 rescue，下一步优先优化 reranker / selection。
+若 top10 和 top20 rescue 都低，下一步继续优化 gap queries 或 candidate precision。
+若 multi full@10 提升且 LLM_C_top10_rescued_count > A_dropped@10_count，保留该流程作为 Agentic RAG 主线。
 ```
 
 ---
@@ -1120,7 +1161,7 @@ Phase 5: Qwen3 Chunk Reranker Baseline
 Phase 6: Error Analysis & Trace Logging
 Phase 7: Rule-based Second-hop Retrieval
 Phase 8: LLM Evidence Sufficiency Checker
-Phase 9: Bounded Agentic RAG Loop
+Phase 9: LLM Gap-query Merged Pool Rerank Loop
 ```
 
 预计时间：
@@ -1191,18 +1232,18 @@ Phase 5: Qwen3 Chunk Reranker Baseline
 Phase 6: Error Analysis & Trace Logging
 Phase 7: Rule-based Second-hop Retrieval implementation
 Phase 8: LLM Evidence Checker pool-level eval implementation
+Phase 9: LLM Gap-query Merged Pool Rerank Loop implementation
 ```
 
 ## Next
 
 ```text
-Phase 8: Server run with Qwen3 8B OpenAI-compatible endpoint
+Phase 9: Server run over Phase 8 merged pools
 ```
 
 ## Planned
 
 ```text
-Phase 9: Bounded Agentic RAG Loop
 Phase 10: Citation-aware Answer Generation
 Phase 11: Verifier / Abstention
 Phase 12: Pairwise Evidence Reranker

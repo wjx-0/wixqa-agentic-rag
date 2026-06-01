@@ -345,6 +345,59 @@ multi_LLM_C_pool_rescued_count > Phase 7 multi_C_pool_rescued_count = 1
 source_C_checker_sufficient_count 越低越好
 ```
 
+服务器 Qwen3 8B run 的 pool-level 结果：
+
+| metric | value |
+| --- | ---: |
+| checker_valid_count | 199 |
+| invalid_json_count | 1 |
+| checker_sufficient_count | 3 |
+| checker_insufficient_count | 196 |
+| source_C_insufficient_rate | 1.0000 |
+| source_C_checker_sufficient_count | 0 |
+| LLM_C_pool_rescued_count | 7 |
+| multi_LLM_C_pool_rescued_count | 4 |
+| merged_pool_full_article_hit_rate | 0.9300 |
+| multi_merged_pool_full_article_hit_rate | 0.8077 |
+| avg_generated_queries | 2.9400 |
+| avg_merged_candidates | 73.5550 |
+
+结论：LLM gap-query 的 pool rescue 明显强于 Phase 7 rule title expansion，因此进入 Phase 9，测试这些补回的 pool evidence 是否能被 Qwen3 reranker 送入最终 top10。
+
+## Stage 9: LLM Gap-query Merged Pool Rerank Loop
+
+已实现 Phase 9 代码：
+
+```text
+Phase 8 checker_traces.jsonl
+-> first-hop top50 + second_hop_results 重建 merged pool
+-> Qwen3 reranker 使用原始 question 重排 merged pool
+-> 评估 final top10 主指标
+-> 额外输出 final top20 诊断指标
+```
+
+Phase 9 v1 不重新调用 LLM，不重新执行 BM25 / Dense / FAISS retrieval。top10 是主上下文预算，top20 只用于判断证据是否被排在 11-20 位。
+
+运行：
+
+```bash
+python scripts/run_agentic_rerank_loop.py \
+  --device cuda \
+  --dense_worker_mode model_only
+```
+
+重点指标：
+
+```text
+multi_chunk_full_article_hit@10
+LLM_C_top10_rescued_count
+multi_LLM_C_top10_rescued_count
+A_dropped@10_count
+LLM_C_top20_rescued_count
+multi_LLM_C_top20_rescued_count
+pool_rescued_but_top20_only_count
+```
+
 ## Current Conclusion
 
 当前最清晰的阶段收益链条是：
@@ -369,7 +422,7 @@ recall@50 = 0.9250
 
 ## Recommended Next Steps
 
-1. 在服务器启动 Qwen3 8B OpenAI-compatible endpoint。
-2. 运行 `scripts/run_llm_evidence_checker.py --device cuda --llm_base_url <url> --llm_model <model>`。
-3. 查看 `outputs/llm_evidence_checker/.../comparison.md`，重点比较 Phase 8 pool rescue 是否超过 Phase 7。
-4. 若 pool rescue 明显提升，Phase 9 再接 merged pool rerank loop；若 pool rescue 仍低，继续强化 checker prompt / query generation。
+1. 在服务器运行 `scripts/run_agentic_rerank_loop.py --device cuda --dense_worker_mode model_only`。
+2. 查看 `outputs/agentic_rag/.../comparison.md`。
+3. 若 top20 rescue 明显高于 top10 rescue，下一步优先分析 reranker / selection。
+4. 若 top10 和 top20 rescue 都低，继续优化 gap query 的 precision 与 missing-evidence targeting。
