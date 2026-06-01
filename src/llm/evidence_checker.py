@@ -105,13 +105,18 @@ def build_evidence_checker_messages(
         [
             "You are an evidence sufficiency checker for Wix Help Center retrieval.",
             "Do not answer the user's question.",
-            "Judge only whether the retrieved chunks contain enough evidence to answer completely.",
-            "If evidence is insufficient, describe the missing evidence concretely.",
-            "next_queries must target the missing_evidence, not merely rewrite the original question.",
+            "Judge whether the retrieved chunks support a correct, useful, and non-misleading answer.",
+            "Set sufficient=true when the available evidence directly supports the answer, even if it is not exhaustive.",
+            "Do not require exact wording, exhaustive edge cases, or more explicit confirmation when the evidence already supports the answer.",
+            "Set sufficient=false only when a blocking evidence gap would make the answer unsupported, materially incomplete, or misleading.",
+            "Do not trigger retrieval for nice-to-have details, extra examples, background context, or minor clarification.",
+            "blocking_missing_evidence must list only blocking gaps that justify another retrieval step.",
+            "nice_to_have_missing_evidence may list non-blocking details, but those must not cause retrieval.",
+            "next_queries must target blocking_missing_evidence, not merely rewrite the original question.",
             "Each next query must include concrete Wix product, feature, action, setting, integration, error, or entity names.",
             "Do not use vague pronouns such as it, this, that feature, or that setting in next_queries.",
             "Generate at most 3 next_queries.",
-            "Return valid JSON only with keys: sufficient, known_facts, missing_evidence, next_queries, reason.",
+            "Return valid JSON only with keys: sufficient, known_facts, blocking_missing_evidence, nice_to_have_missing_evidence, next_queries, reason.",
         ]
     )
     context_lines = []
@@ -142,7 +147,9 @@ def build_evidence_checker_messages(
             (
                 "JSON schema:\n"
                 '{"sufficient": boolean, "known_facts": string[], '
-                '"missing_evidence": string[], "next_queries": string[], "reason": string}'
+                '"blocking_missing_evidence": string[], '
+                '"nice_to_have_missing_evidence": string[], '
+                '"next_queries": string[], "reason": string}'
             ),
         ]
     )
@@ -169,15 +176,31 @@ def parse_checker_response(
 
     sufficient = parse_bool(payload.get("sufficient"))
     known_facts = normalize_text_list(payload.get("known_facts"))
-    missing_evidence = normalize_text_list(payload.get("missing_evidence"))
-    next_queries = [] if sufficient else normalize_queries(
-        payload.get("next_queries"),
-        max_next_queries=max_next_queries,
+    blocking_missing_evidence = normalize_text_list(
+        payload.get("blocking_missing_evidence")
     )
+    legacy_missing_evidence = normalize_text_list(payload.get("missing_evidence"))
+    if not blocking_missing_evidence:
+        blocking_missing_evidence = legacy_missing_evidence
+    nice_to_have_missing_evidence = normalize_text_list(
+        payload.get("nice_to_have_missing_evidence")
+    )
+    if sufficient:
+        blocking_missing_evidence = []
+        next_queries = []
+    elif blocking_missing_evidence:
+        next_queries = normalize_queries(
+            payload.get("next_queries"),
+            max_next_queries=max_next_queries,
+        )
+    else:
+        next_queries = []
     return {
         "sufficient": sufficient,
         "known_facts": known_facts,
-        "missing_evidence": missing_evidence,
+        "missing_evidence": blocking_missing_evidence,
+        "blocking_missing_evidence": blocking_missing_evidence,
+        "nice_to_have_missing_evidence": nice_to_have_missing_evidence,
         "next_queries": next_queries,
         "reason": compact_text(payload.get("reason")),
     }

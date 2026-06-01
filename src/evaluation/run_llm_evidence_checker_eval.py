@@ -433,7 +433,12 @@ def run_checker_for_row(
         checker_valid = False
         checker_error = str(exc)
 
-    next_queries = checker_result["next_queries"] if checker_valid else []
+    should_retrieve = (
+        checker_valid
+        and checker_result["sufficient"] is False
+        and bool(checker_result["blocking_missing_evidence"])
+    )
+    next_queries = checker_result["next_queries"] if should_retrieve else []
     second_hop_queries = [
         {"query_id": f"gap_query_{index}", "query_text": query}
         for index, query in enumerate(next_queries, start=1)
@@ -447,6 +452,8 @@ def run_checker_for_row(
         "checker_sufficient": checker_result["sufficient"] if checker_valid else None,
         "known_facts": checker_result["known_facts"],
         "missing_evidence": checker_result["missing_evidence"],
+        "blocking_missing_evidence": checker_result["blocking_missing_evidence"],
+        "nice_to_have_missing_evidence": checker_result["nice_to_have_missing_evidence"],
         "next_queries": next_queries,
         "second_hop_queries": second_hop_queries,
         "retrieval_triggered": bool(second_hop_queries),
@@ -508,6 +515,8 @@ def empty_checker_result() -> dict[str, Any]:
         "sufficient": None,
         "known_facts": [],
         "missing_evidence": [],
+        "blocking_missing_evidence": [],
+        "nice_to_have_missing_evidence": [],
         "next_queries": [],
         "reason": "",
     }
@@ -613,6 +622,13 @@ def summarize_checker_traces(
         row for row in source_a_rows
         if row["checker_valid"] and row["checker_sufficient"] is True
     ]
+    source_a_checker_insufficient_rows = [
+        row for row in source_a_rows
+        if row["checker_valid"] and row["checker_sufficient"] is False
+    ]
+    source_a_retrieval_rows = [
+        row for row in source_a_rows if row.get("retrieval_triggered")
+    ]
     summary = {
         "dataset_name": baseline_metrics["dataset_name"],
         "records": len(traces),
@@ -633,6 +649,11 @@ def summarize_checker_traces(
         "source_C_count": len(source_c_rows),
         "source_A_sufficient_rate": (
             len(source_a_checker_sufficient_rows) / len(source_a_rows) if source_a_rows else 0.0
+        ),
+        "source_A_insufficient_count": len(source_a_checker_insufficient_rows),
+        "source_A_unnecessary_retrieval_count": len(source_a_retrieval_rows),
+        "avg_queries_for_source_A": average(
+            len(row["second_hop_queries"]) for row in source_a_rows
         ),
         "source_C_insufficient_rate": (
             len(source_c_checker_insufficient_rows) / len(source_c_rows) if source_c_rows else 0.0
@@ -720,6 +741,13 @@ def render_metrics_markdown(summary: dict[str, Any]) -> str:
         ["invalid_json_count", summary["invalid_json_count"]],
         ["checker_sufficient_count", summary["checker_sufficient_count"]],
         ["checker_insufficient_count", summary["checker_insufficient_count"]],
+        ["source_A_sufficient_rate", f"{summary['source_A_sufficient_rate']:.4f}"],
+        ["source_A_insufficient_count", summary["source_A_insufficient_count"]],
+        [
+            "source_A_unnecessary_retrieval_count",
+            summary["source_A_unnecessary_retrieval_count"],
+        ],
+        ["avg_queries_for_source_A", f"{summary['avg_queries_for_source_A']:.4f}"],
         ["source_C_insufficient_rate", f"{summary['source_C_insufficient_rate']:.4f}"],
         ["source_C_checker_sufficient_count", summary["source_C_checker_sufficient_count"]],
         ["LLM_C_pool_rescued_count", summary["LLM_C_pool_rescued_count"]],

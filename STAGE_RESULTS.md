@@ -345,6 +345,17 @@ multi_LLM_C_pool_rescued_count > Phase 7 multi_C_pool_rescued_count = 1
 source_C_checker_sufficient_count 越低越好
 ```
 
+旧版 checker 过于保守：服务器 run 中 `source_A_count=160`，但 `source_A_sufficient_rate=0.0125`，即 top10 已覆盖全部 gold articles 的样本大多仍被判为 insufficient。已将 checker 校准为只在存在 `blocking_missing_evidence` 时触发 second-hop；`nice_to_have_missing_evidence` 不触发检索。复跑 Phase 8 时需要重点观察：
+
+```text
+source_A_sufficient_rate 越高越好
+source_A_insufficient_count 越低越好
+source_A_unnecessary_retrieval_count 越低越好
+avg_queries_for_source_A 越低越好
+source_C_checker_sufficient_count 仍需接近 0
+LLM_C_pool_rescued_count 不应明显下降
+```
+
 服务器 Qwen3 8B run 的 pool-level 结果：
 
 | metric | value |

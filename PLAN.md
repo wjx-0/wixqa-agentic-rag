@@ -797,7 +797,8 @@ baseline reranker top10 chunks
 {
   "sufficient": false,
   "known_facts": [],
-  "missing_evidence": [],
+  "blocking_missing_evidence": [],
+  "nice_to_have_missing_evidence": [],
   "next_queries": [],
   "reason": ""
 }
@@ -807,19 +808,22 @@ Prompt 强约束：
 
 ```text
 1. Do not answer the user's question.
-2. Only judge whether retrieved chunks contain enough evidence.
-3. missing_evidence must describe the concrete missing evidence.
-4. next_queries must target missing_evidence, not merely rewrite the original question.
-5. next_queries must contain concrete Wix product, feature, action, setting, integration, error, or entity names.
-6. Do not use vague pronouns like it, this, that feature, or that setting.
-7. Generate at most 3 next_queries.
-8. Return valid JSON only.
+2. sufficient=true means the chunks support a correct, useful, non-misleading answer.
+3. Do not require exhaustive edge cases, exact wording, or more explicit confirmation.
+4. sufficient=false only when a blocking evidence gap would make the answer unsupported, materially incomplete, or misleading.
+5. blocking_missing_evidence must contain only retrieval-worthy blocking gaps.
+6. nice_to_have_missing_evidence must not trigger retrieval.
+7. next_queries must target blocking_missing_evidence, not merely rewrite the original question.
+8. next_queries must contain concrete Wix product, feature, action, setting, integration, error, or entity names.
+9. Do not use vague pronouns like it, this, that feature, or that setting.
+10. Generate at most 3 next_queries.
+11. Return valid JSON only.
 ```
 
 ## Pool-level Eval
 
 ```text
-checker insufficient + next_queries
+checker insufficient + blocking_missing_evidence + next_queries
   -> Hybrid BM25 + Dense RRF per query
   -> second_hop_fused_top_k_chunks = 20
   -> merge with first-hop Hybrid top50 by chunk_id
@@ -863,6 +867,10 @@ checker_valid_count
 invalid_json_count
 checker_sufficient_count
 checker_insufficient_count
+source_A_sufficient_rate
+source_A_insufficient_count
+source_A_unnecessary_retrieval_count
+avg_queries_for_source_A
 source_C_insufficient_rate
 source_C_checker_sufficient_count
 LLM_C_pool_rescued_count
@@ -881,6 +889,8 @@ avg_merged_candidates
 LLM_C_pool_rescued_count > Phase 7 C_pool_rescued_count = 3
 multi_LLM_C_pool_rescued_count > Phase 7 multi_C_pool_rescued_count = 1
 source_C_checker_sufficient_count 越低越好
+source_A_sufficient_rate 越高越好
+source_A_unnecessary_retrieval_count 越低越好
 ```
 
 ---

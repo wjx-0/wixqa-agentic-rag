@@ -97,8 +97,9 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
         self.assertNotIn("gold_article_ids", prompt)
         self.assertNotIn("case_type", prompt)
         self.assertNotIn("missing_articles", prompt)
-        self.assertIn("next_queries must target the missing_evidence", prompt)
+        self.assertIn("next_queries must target blocking_missing_evidence", prompt)
         self.assertIn("not merely rewrite the original question", prompt)
+        self.assertIn("Do not trigger retrieval for nice-to-have details", prompt)
 
     def test_parse_fenced_json_and_normalizes_queries(self) -> None:
         parsed = parse_checker_response(
@@ -107,7 +108,8 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
             {
               "sufficient": false,
               "known_facts": ["fact"],
-              "missing_evidence": ["missing setup step"],
+              "blocking_missing_evidence": ["missing setup step"],
+              "nice_to_have_missing_evidence": ["extra screenshot"],
               "next_queries": ["Wix GA4 setup", " ", "wix ga4 setup", "Wix Tag Manager"],
               "reason": "Need more evidence"
             }
@@ -117,7 +119,33 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
         )
 
         self.assertFalse(parsed["sufficient"])
+        self.assertEqual(parsed["blocking_missing_evidence"], ["missing setup step"])
+        self.assertEqual(parsed["nice_to_have_missing_evidence"], ["extra screenshot"])
         self.assertEqual(parsed["next_queries"], ["Wix GA4 setup", "Wix Tag Manager"])
+
+    def test_parse_legacy_missing_evidence_as_blocking_for_compatibility(self) -> None:
+        parsed = parse_checker_response(
+            '{"sufficient": false, "known_facts": [], '
+            '"missing_evidence": ["legacy blocking gap"], '
+            '"next_queries": ["Wix legacy gap"], "reason": "legacy"}',
+        )
+
+        self.assertEqual(parsed["blocking_missing_evidence"], ["legacy blocking gap"])
+        self.assertEqual(parsed["missing_evidence"], ["legacy blocking gap"])
+        self.assertEqual(parsed["next_queries"], ["Wix legacy gap"])
+
+    def test_non_blocking_missing_evidence_clears_queries(self) -> None:
+        parsed = parse_checker_response(
+            '{"sufficient": false, "known_facts": ["enough"], '
+            '"blocking_missing_evidence": [], '
+            '"nice_to_have_missing_evidence": ["extra example"], '
+            '"next_queries": ["Wix extra example"], "reason": "minor"}',
+        )
+
+        self.assertFalse(parsed["sufficient"])
+        self.assertEqual(parsed["blocking_missing_evidence"], [])
+        self.assertEqual(parsed["nice_to_have_missing_evidence"], ["extra example"])
+        self.assertEqual(parsed["next_queries"], [])
 
     def test_sufficient_response_clears_queries(self) -> None:
         parsed = parse_checker_response(
@@ -205,12 +233,16 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
             checker = FakeLLMClient(
                 [
                     '{"sufficient": true, "known_facts": ["covered"], '
-                    '"missing_evidence": [], "next_queries": ["ignored"], "reason": "ok"}',
+                    '"blocking_missing_evidence": [], '
+                    '"nice_to_have_missing_evidence": ["extra"], '
+                    '"next_queries": ["ignored"], "reason": "ok"}',
                     '{"sufficient": false, "known_facts": [], '
-                    '"missing_evidence": ["Need Wix CMS table connection setup"], '
+                    '"blocking_missing_evidence": ["Need Wix CMS table connection setup"], '
+                    '"nice_to_have_missing_evidence": [], '
                     '"next_queries": ["Wix CMS table connect collection"], "reason": "missing"}',
                     '{"sufficient": false, "known_facts": [], '
-                    '"missing_evidence": ["Need Wix Stores tax setup"], '
+                    '"blocking_missing_evidence": ["Need Wix Stores tax setup"], '
+                    '"nice_to_have_missing_evidence": [], '
                     '"next_queries": ["Wix Stores tax setup"], "reason": "partial"}',
                     'not json',
                 ]
@@ -249,6 +281,8 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
             self.assertEqual(summary["invalid_json_count"], 1)
             self.assertEqual(summary["checker_sufficient_count"], 1)
             self.assertEqual(summary["checker_insufficient_count"], 2)
+            self.assertEqual(summary["source_A_insufficient_count"], 0)
+            self.assertEqual(summary["source_A_unnecessary_retrieval_count"], 0)
             self.assertEqual(summary["LLM_C_pool_rescued_count"], 1)
             self.assertEqual(summary["multi_LLM_C_pool_rescued_count"], 1)
             self.assertEqual(summary["pool_new_gold_articles_count"], 2)
@@ -264,6 +298,78 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
                 len(list(read_jsonl(run_dir / "multi_cases_C_pool_rescued_by_llm_checker.jsonl"))),
                 1,
             )
+
+    def test_eval_does_not_retrieve_for_nice_to_have_only_gaps(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            hybrid_dir = root / "hybrid"
+            baseline_dir = root / "baseline"
+            control_dir = root / "control"
+            control_hybrid_dir = root / "control_hybrid"
+            rule_dir = root / "rule"
+            for path in (hybrid_dir, baseline_dir, control_dir, control_hybrid_dir, rule_dir):
+                path.mkdir()
+            chunks_path = root / "chunks.jsonl"
+
+            rows, traces, chunks = build_fixture_rows()
+            rows = rows[:1]
+            traces = traces[:1]
+            chunks = chunks[:50]
+            write_jsonl(chunks_path, chunks)
+            write_json(
+                hybrid_dir / "metrics.json",
+                {**hybrid_metric_summary(fused_top_k_chunks=50), "records": 1},
+            )
+            write_jsonl(hybrid_dir / "candidates.jsonl", rows)
+            write_json(
+                baseline_dir / "metrics.json",
+                metric_summary(candidate_top_k_chunks=50),
+            )
+            write_jsonl(baseline_dir / "rerank_traces.jsonl", traces)
+            write_json(
+                control_dir / "metrics.json",
+                metric_summary(candidate_top_k_chunks=100),
+            )
+            write_json(
+                control_dir / "run_config.json",
+                {"source_hybrid_run_dir": str(control_hybrid_dir)},
+            )
+            write_json(
+                control_hybrid_dir / "metrics.json",
+                hybrid_metric_summary(fused_top_k_chunks=100),
+            )
+            write_json(rule_dir / "metrics.json", phase7_metric_summary())
+
+            checker = FakeLLMClient(
+                [
+                    '{"sufficient": false, "known_facts": ["answer supported"], '
+                    '"blocking_missing_evidence": [], '
+                    '"nice_to_have_missing_evidence": ["could include more examples"], '
+                    '"next_queries": ["Wix more examples"], "reason": "not blocking"}',
+                ]
+            )
+            retriever = FakeRetriever({"Wix more examples": [candidate("new", "new", 1)]})
+
+            summary = run_llm_evidence_checker_eval(
+                first_hop_hybrid_run_dir=hybrid_dir,
+                baseline_rerank_run_dir=baseline_dir,
+                top100_control_rerank_run_dir=control_dir,
+                rule_second_hop_run_dir=rule_dir,
+                chunks_path=chunks_path,
+                output_dir=root / "outputs",
+                checker_client=checker,
+                retriever=retriever,
+                console=Console(file=None, quiet=True),
+            )
+
+            run_dir = root / "outputs" / "hybrid" / "baseline" / "qwen3_8b_s3_h20_pool_eval"
+            trace = next(read_jsonl(run_dir / "checker_traces.jsonl"))
+
+            self.assertEqual(retriever.queries, [])
+            self.assertFalse(trace["retrieval_triggered"])
+            self.assertEqual(trace["second_hop_queries"], [])
+            self.assertEqual(trace["nice_to_have_missing_evidence"], ["could include more examples"])
+            self.assertEqual(summary["source_A_unnecessary_retrieval_count"], 0)
 
 
 def build_fixture_rows() -> tuple[list[dict], list[dict], list[KBChunk]]:

@@ -297,7 +297,7 @@ python scripts/run_llm_evidence_checker.py \
   --llm_model <server-qwen3-8b-model-name>
 ```
 
-Phase 8 默认读取主线 top50 baseline、公平 top100 control、Phase 7 rule second-hop 结果、FAISS index 和 chunks。该阶段只检查 LLM gap queries 是否补齐 merged pool，不重新 rerank merged pool。
+Phase 8 默认读取主线 top50 baseline、公平 top100 control、Phase 7 rule second-hop 结果、FAISS index 和 chunks。该阶段只检查 LLM gap queries 是否补齐 merged pool，不重新 rerank merged pool。Checker 已校准为只在存在 `blocking_missing_evidence` 时触发 second-hop；`nice_to_have_missing_evidence` 不会触发检索。
 
 运行 Phase 9 merged-pool rerank loop：
 
@@ -566,13 +566,13 @@ LLM Evidence Sufficiency Checker pool-level eval：
 ```text
 baseline reranker top10 chunks
   -> LLM 判断证据是否充足
-  -> insufficient 时生成最多 3 条 missing-evidence-oriented queries
+  -> 只有 blocking_missing_evidence 时生成最多 3 条 gap queries
   -> 每条 query 执行 Hybrid top20
   -> 与首轮 Hybrid top50 按 chunk_id 合并
   -> 只评估 merged pool 是否覆盖缺失 gold articles
 ```
 
-Phase 8 明确不是最终 rerank loop：`comparison.md` 中的 Phase 8 行只报告 pool rescue，不报告 final top10 context quality。Gold labels 只用于离线评测，不进入 prompt 或 query generation。
+Phase 8 明确不是最终 rerank loop：`comparison.md` 中的 Phase 8 行只报告 pool rescue，不报告 final top10 context quality。Gold labels 只用于离线评测，不进入 prompt 或 query generation。Checker prompt 要求 `sufficient=true` 可用于“证据足以支持正确、有用且不误导的回答”，不要求穷尽所有边界情况或更明确措辞。
 
 ## 后续路线图
 
