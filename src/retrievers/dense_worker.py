@@ -29,6 +29,11 @@ def parse_bool(value: str | bool) -> bool:
 
 
 def configure_offline_mode(local_files_only: bool) -> None:
+    hf_home = Path("/root/rivermind-data/models/huggingface")
+    if hf_home.exists():
+        os.environ["HF_HOME"] = str(hf_home)
+        os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf_home / "hub")
+        os.environ["TRANSFORMERS_CACHE"] = str(hf_home / "hub")
     if local_files_only:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")

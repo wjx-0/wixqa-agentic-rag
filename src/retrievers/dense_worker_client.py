@@ -58,6 +58,11 @@ class DenseWorkerClient:
 
         root = Path(__file__).resolve().parents[2]
         env = os.environ.copy()
+        hf_home = Path("/root/rivermind-data/models/huggingface")
+        if hf_home.exists():
+            env["HF_HOME"] = str(hf_home)
+            env["HUGGINGFACE_HUB_CACHE"] = str(hf_home / "hub")
+            env["TRANSFORMERS_CACHE"] = str(hf_home / "hub")
         python_path = env.get("PYTHONPATH")
         env["PYTHONPATH"] = str(root) if not python_path else f"{root}{os.pathsep}{python_path}"
         if self.local_files_only:
