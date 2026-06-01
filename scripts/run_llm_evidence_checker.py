@@ -86,6 +86,7 @@ def main() -> int:
     parser.add_argument("--llm_temperature", type=float, default=DEFAULT_CHECKER_TEMPERATURE)
     parser.add_argument("--llm_max_tokens", type=int, default=DEFAULT_CHECKER_MAX_TOKENS)
     parser.add_argument("--llm_timeout", type=float, default=DEFAULT_CHECKER_TIMEOUT)
+    parser.add_argument("--llm_concurrency", type=int, default=1)
     parser.add_argument("--context_preview_chars", type=int, default=DEFAULT_CONTEXT_PREVIEW_CHARS)
     args = parser.parse_args()
 
@@ -115,6 +116,7 @@ def main() -> int:
             llm_temperature=args.llm_temperature,
             llm_max_tokens=args.llm_max_tokens,
             llm_timeout=args.llm_timeout,
+            llm_concurrency=args.llm_concurrency,
             context_preview_chars=args.context_preview_chars,
             console=Console(),
         )
@@ -126,4 +128,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

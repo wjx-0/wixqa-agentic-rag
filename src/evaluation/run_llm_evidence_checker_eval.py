@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 import os
 import re
@@ -99,6 +100,7 @@ def run_llm_evidence_checker_eval(
     llm_temperature: float = DEFAULT_CHECKER_TEMPERATURE,
     llm_max_tokens: int = DEFAULT_CHECKER_MAX_TOKENS,
     llm_timeout: float = DEFAULT_CHECKER_TIMEOUT,
+    llm_concurrency: int = 1,
     context_preview_chars: int = DEFAULT_CONTEXT_PREVIEW_CHARS,
     checker_client: Any | None = None,
     retriever: Any | None = None,
@@ -115,6 +117,7 @@ def run_llm_evidence_checker_eval(
         llm_temperature=llm_temperature,
         llm_max_tokens=llm_max_tokens,
         llm_timeout=llm_timeout,
+        llm_concurrency=llm_concurrency,
         context_preview_chars=context_preview_chars,
     )
     console = console or Console()
@@ -187,22 +190,19 @@ def run_llm_evidence_checker_eval(
         timeout=llm_timeout,
     )
 
-    checker_traces = []
-    query_plans: dict[str, list[dict[str, Any]]] = {}
-    for candidate_row in tqdm(candidate_rows, desc="LLM evidence checker"):
-        qid = candidate_row["qid"]
-        baseline_trace = baseline_traces[qid]
-        checker_trace = run_checker_for_row(
-            candidate_row=candidate_row,
-            baseline_trace=baseline_trace,
-            checker_client=checker_client,
-            llm_temperature=llm_temperature,
-            llm_max_tokens=llm_max_tokens,
-            max_next_queries=max_next_queries,
-            context_preview_chars=context_preview_chars,
-        )
-        checker_traces.append(checker_trace)
-        query_plans[qid] = checker_trace["second_hop_queries"]
+    checker_traces = run_checker_batch(
+        candidate_rows,
+        baseline_traces,
+        checker_client=checker_client,
+        llm_temperature=llm_temperature,
+        llm_max_tokens=llm_max_tokens,
+        max_next_queries=max_next_queries,
+        context_preview_chars=context_preview_chars,
+        llm_concurrency=llm_concurrency,
+    )
+    query_plans: dict[str, list[dict[str, Any]]] = {
+        trace["qid"]: trace["second_hop_queries"] for trace in checker_traces
+    }
 
     retrieval_batches = run_second_hop_retrieval(
         query_plans,
@@ -295,6 +295,7 @@ def run_llm_evidence_checker_eval(
             "llm_temperature": llm_temperature,
             "llm_max_tokens": llm_max_tokens,
             "llm_timeout": llm_timeout,
+            "llm_concurrency": llm_concurrency,
             "context_preview_chars": context_preview_chars,
             "eval_scope": "pool_level_only_no_final_rerank",
             "merged_candidate_upper_bound": merged_candidate_upper_bound,
@@ -316,6 +317,7 @@ def validate_args(
     llm_temperature: float,
     llm_max_tokens: int,
     llm_timeout: float,
+    llm_concurrency: int,
     context_preview_chars: int,
 ) -> None:
     positive_values = {
@@ -325,6 +327,7 @@ def validate_args(
         "rrf_k": rrf_k,
         "dense_query_batch_size": dense_query_batch_size,
         "llm_max_tokens": llm_max_tokens,
+        "llm_concurrency": llm_concurrency,
         "context_preview_chars": context_preview_chars,
     }
     for name, value in positive_values.items():
@@ -449,6 +452,55 @@ def run_checker_for_row(
         "retrieval_triggered": bool(second_hop_queries),
         "llm_calls": 1,
     }
+
+
+def run_checker_batch(
+    candidate_rows: list[dict[str, Any]],
+    baseline_traces: dict[str, dict[str, Any]],
+    *,
+    checker_client: Any,
+    llm_temperature: float,
+    llm_max_tokens: int,
+    max_next_queries: int,
+    context_preview_chars: int,
+    llm_concurrency: int,
+) -> list[dict[str, Any]]:
+    if llm_concurrency <= 1:
+        traces = []
+        for candidate_row in tqdm(candidate_rows, desc="LLM evidence checker"):
+            qid = candidate_row["qid"]
+            traces.append(
+                run_checker_for_row(
+                    candidate_row=candidate_row,
+                    baseline_trace=baseline_traces[qid],
+                    checker_client=checker_client,
+                    llm_temperature=llm_temperature,
+                    llm_max_tokens=llm_max_tokens,
+                    max_next_queries=max_next_queries,
+                    context_preview_chars=context_preview_chars,
+                )
+            )
+        return traces
+
+    traces: list[dict[str, Any] | None] = [None] * len(candidate_rows)
+    with ThreadPoolExecutor(max_workers=llm_concurrency) as executor:
+        futures = {
+            executor.submit(
+                run_checker_for_row,
+                candidate_row=candidate_row,
+                baseline_trace=baseline_traces[candidate_row["qid"]],
+                checker_client=checker_client,
+                llm_temperature=llm_temperature,
+                llm_max_tokens=llm_max_tokens,
+                max_next_queries=max_next_queries,
+                context_preview_chars=context_preview_chars,
+            ): index
+            for index, candidate_row in enumerate(candidate_rows)
+        }
+        for future in tqdm(as_completed(futures), total=len(futures), desc="LLM evidence checker"):
+            traces[futures[future]] = future.result()
+
+    return [trace for trace in traces if trace is not None]
 
 
 def empty_checker_result() -> dict[str, Any]:
