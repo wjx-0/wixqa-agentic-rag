@@ -260,7 +260,6 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
             summary = run_llm_evidence_checker_eval(
                 first_hop_hybrid_run_dir=hybrid_dir,
                 baseline_rerank_run_dir=baseline_dir,
-                top100_control_rerank_run_dir=control_dir,
                 rule_second_hop_run_dir=rule_dir,
                 chunks_path=chunks_path,
                 output_dir=root / "outputs",
@@ -292,7 +291,11 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
             self.assertAlmostEqual(summary["source_C_insufficient_rate"], 2 / 3)
             self.assertIn("Phase 8 is pool-level evaluation only.", comparison)
             self.assertIn("does not rerank the merged pool", comparison)
+            self.assertIn("Top100 Hybrid + Qwen3 control", comparison)
+            self.assertIn("N/A", comparison)
+            self.assertIsNone(summary["top100_control_metrics"])
             self.assertEqual(run_config["eval_scope"], "pool_level_only_no_final_rerank")
+            self.assertIsNone(run_config["top100_control_rerank_run_dir"])
             self.assertEqual(
                 len(list(read_jsonl(run_dir / "cases_invalid_checker_json.jsonl"))),
                 1,
@@ -356,7 +359,6 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
             summary = run_llm_evidence_checker_eval(
                 first_hop_hybrid_run_dir=hybrid_dir,
                 baseline_rerank_run_dir=baseline_dir,
-                top100_control_rerank_run_dir=control_dir,
                 rule_second_hop_run_dir=rule_dir,
                 chunks_path=chunks_path,
                 output_dir=root / "outputs",

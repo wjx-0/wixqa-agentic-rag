@@ -172,6 +172,13 @@ class RuleSecondHopTest(unittest.TestCase):
                 {"different": {}},
             )
 
+    def test_qid_validation_allows_missing_optional_control(self) -> None:
+        validate_qid_sets(
+            [{"qid": "a"}],
+            {"a": {}},
+            None,
+        )
+
     def test_fair_top100_control_only_changes_fused_cutoff(self) -> None:
         first_hop = hybrid_metric_summary(fused_top_k_chunks=50)
         control = hybrid_metric_summary(fused_top_k_chunks=100)

@@ -358,7 +358,6 @@ class AgenticRerankTest(unittest.TestCase):
             summary = run_agentic_rerank_eval(
                 first_hop_hybrid_run_dir=hybrid_dir,
                 baseline_rerank_run_dir=baseline_dir,
-                top100_control_rerank_run_dir=control_dir,
                 rule_second_hop_run_dir=rule_dir,
                 llm_checker_run_dir=checker_dir,
                 chunks_path=chunks_path,
@@ -390,6 +389,8 @@ class AgenticRerankTest(unittest.TestCase):
             self.assertEqual(run_config["rerank_scoring_mode"], "gap_aware")
             self.assertEqual(run_config["gap_aware_alpha"], GAP_AWARE_ALPHA)
             self.assertEqual(run_config["gap_aware_beta"], GAP_AWARE_BETA)
+            self.assertIsNone(summary["top100_control_metrics"])
+            self.assertIsNone(run_config["top100_control_rerank_run_dir"])
             self.assertIn("score_original", traces[0]["final_top10_chunks"][0])
             self.assertIn("gap_aware_score", traces[0]["final_top10_chunks"][0])
             self.assertEqual(

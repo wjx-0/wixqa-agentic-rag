@@ -23,7 +23,6 @@ from src.evaluation.run_rule_second_hop_eval import (
     DEFAULT_CHUNKS_PATH,
     DEFAULT_FIRST_HOP_HYBRID_RUN_DIR,
     DEFAULT_RERANK_BATCH_SIZE,
-    DEFAULT_TOP100_CONTROL_RERANK_RUN_DIR,
 )
 from src.rerankers.cross_encoder_reranker import (
     DEFAULT_INSTRUCTION_NAME,
@@ -53,7 +52,8 @@ def main() -> int:
     parser.add_argument("--baseline_rerank_run_dir", default=DEFAULT_BASELINE_RERANK_RUN_DIR)
     parser.add_argument(
         "--top100_control_rerank_run_dir",
-        default=DEFAULT_TOP100_CONTROL_RERANK_RUN_DIR,
+        default=None,
+        help="Optional top100 reranker control run. Omit to skip top100 comparison.",
     )
     parser.add_argument("--rule_second_hop_run_dir", default=DEFAULT_RULE_SECOND_HOP_RUN_DIR)
     parser.add_argument("--llm_checker_run_dir", default=DEFAULT_LLM_CHECKER_RUN_DIR)

@@ -32,16 +32,15 @@ from src.evaluation.run_rule_second_hop_eval import (
     DEFAULT_INDEX_DIR,
     DEFAULT_RRF_K,
     DEFAULT_SECOND_HOP_TOP_K_CHUNKS,
-    DEFAULT_TOP100_CONTROL_RERANK_RUN_DIR,
     RuleSecondHopEvalError,
     average,
     count_true,
-    load_control_hybrid_run_dir,
     load_json_object,
+    load_optional_top100_control,
     load_rerank_trace_lookup,
+    optional_artifact_path,
     run_second_hop_retrieval,
     validate_candidate_cutoff,
-    validate_fair_top100_control,
 )
 from src.llm.evidence_checker import (
     DEFAULT_CHECKER_MAX_TOKENS,
@@ -78,7 +77,7 @@ def run_llm_evidence_checker_eval(
     *,
     first_hop_hybrid_run_dir: str | Path = DEFAULT_FIRST_HOP_HYBRID_RUN_DIR,
     baseline_rerank_run_dir: str | Path = DEFAULT_BASELINE_RERANK_RUN_DIR,
-    top100_control_rerank_run_dir: str | Path = DEFAULT_TOP100_CONTROL_RERANK_RUN_DIR,
+    top100_control_rerank_run_dir: str | Path | None = None,
     rule_second_hop_run_dir: str | Path = DEFAULT_RULE_SECOND_HOP_RUN_DIR,
     chunks_path: str | Path = DEFAULT_CHUNKS_PATH,
     index_dir: str | Path = DEFAULT_INDEX_DIR,
@@ -123,7 +122,7 @@ def run_llm_evidence_checker_eval(
     console = console or Console()
     first_hop_hybrid_run_dir = Path(first_hop_hybrid_run_dir)
     baseline_rerank_run_dir = Path(baseline_rerank_run_dir)
-    top100_control_rerank_run_dir = Path(top100_control_rerank_run_dir)
+    top100_control_rerank_run_dir = optional_artifact_path(top100_control_rerank_run_dir)
     rule_second_hop_run_dir = Path(rule_second_hop_run_dir)
     chunks_path = Path(chunks_path)
 
@@ -152,18 +151,9 @@ def run_llm_evidence_checker_eval(
         baseline_traces = load_rerank_trace_lookup(
             baseline_rerank_run_dir / "rerank_traces.jsonl"
         )
-        control_metrics = load_json_object(top100_control_rerank_run_dir / "metrics.json")
-        validate_candidate_cutoff(
-            control_metrics,
-            100,
-            artifact_name="Top100 control reranker metrics",
-        )
-        control_config = load_json_object(top100_control_rerank_run_dir / "run_config.json")
-        control_hybrid_run_dir = load_control_hybrid_run_dir(control_config)
-        control_hybrid_metrics = load_json_object(control_hybrid_run_dir / "metrics.json")
-        validate_fair_top100_control(
+        control_metrics, _, _ = load_optional_top100_control(
+            top100_control_rerank_run_dir,
             first_hop_metrics=first_hop_metrics,
-            control_hybrid_metrics=control_hybrid_metrics,
         )
         rule_second_hop_metrics = load_json_object(rule_second_hop_run_dir / "metrics.json")
         validate_candidate_baseline_qids(candidate_rows, baseline_traces)
@@ -274,7 +264,11 @@ def run_llm_evidence_checker_eval(
         run_config={
             "first_hop_hybrid_run_dir": str(first_hop_hybrid_run_dir),
             "baseline_rerank_run_dir": str(baseline_rerank_run_dir),
-            "top100_control_rerank_run_dir": str(top100_control_rerank_run_dir),
+            "top100_control_rerank_run_dir": (
+                str(top100_control_rerank_run_dir)
+                if top100_control_rerank_run_dir is not None
+                else None
+            ),
             "rule_second_hop_run_dir": str(rule_second_hop_run_dir),
             "chunks_path": str(chunks_path),
             "index_dir": str(index_dir),
@@ -604,7 +598,7 @@ def summarize_checker_traces(
     traces: list[dict[str, Any]],
     *,
     baseline_metrics: dict[str, Any],
-    control_metrics: dict[str, Any],
+    control_metrics: dict[str, Any] | None,
     rule_second_hop_metrics: dict[str, Any],
     merged_candidate_upper_bound: int,
 ) -> dict[str, Any]:
@@ -836,7 +830,9 @@ def render_comparison_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def metric_value(metrics: dict[str, Any], key: str) -> str:
+def metric_value(metrics: dict[str, Any] | None, key: str) -> str:
+    if metrics is None:
+        return "N/A"
     value = metrics.get(key)
     if value is None:
         return "-"

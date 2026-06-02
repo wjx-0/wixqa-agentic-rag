@@ -23,7 +23,6 @@ from src.evaluation.run_rule_second_hop_eval import (
     DEFAULT_RERANK_BATCH_SIZE,
     DEFAULT_RRF_K,
     DEFAULT_SECOND_HOP_TOP_K_CHUNKS,
-    DEFAULT_TOP100_CONTROL_RERANK_RUN_DIR,
     RuleSecondHopEvalError,
     run_rule_second_hop_eval,
 )
@@ -55,7 +54,8 @@ def main() -> int:
     parser.add_argument("--baseline_rerank_run_dir", default=DEFAULT_BASELINE_RERANK_RUN_DIR)
     parser.add_argument(
         "--top100_control_rerank_run_dir",
-        default=DEFAULT_TOP100_CONTROL_RERANK_RUN_DIR,
+        default=None,
+        help="Optional top100 reranker control run. Omit to skip top100 comparison.",
     )
     parser.add_argument("--chunks_path", default=DEFAULT_CHUNKS_PATH)
     parser.add_argument("--index_dir", default=DEFAULT_INDEX_DIR)

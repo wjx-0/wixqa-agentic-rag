@@ -77,7 +77,7 @@ def run_rule_second_hop_eval(
     *,
     first_hop_hybrid_run_dir: str | Path = DEFAULT_FIRST_HOP_HYBRID_RUN_DIR,
     baseline_rerank_run_dir: str | Path = DEFAULT_BASELINE_RERANK_RUN_DIR,
-    top100_control_rerank_run_dir: str | Path = DEFAULT_TOP100_CONTROL_RERANK_RUN_DIR,
+    top100_control_rerank_run_dir: str | Path | None = None,
     chunks_path: str | Path = DEFAULT_CHUNKS_PATH,
     index_dir: str | Path = DEFAULT_INDEX_DIR,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
@@ -115,7 +115,7 @@ def run_rule_second_hop_eval(
     console = console or Console()
     first_hop_hybrid_run_dir = Path(first_hop_hybrid_run_dir)
     baseline_rerank_run_dir = Path(baseline_rerank_run_dir)
-    top100_control_rerank_run_dir = Path(top100_control_rerank_run_dir)
+    top100_control_rerank_run_dir = optional_artifact_path(top100_control_rerank_run_dir)
     chunks_path = Path(chunks_path)
 
     try:
@@ -143,21 +143,9 @@ def run_rule_second_hop_eval(
         baseline_traces = load_rerank_trace_lookup(
             baseline_rerank_run_dir / "rerank_traces.jsonl"
         )
-        control_metrics = load_json_object(top100_control_rerank_run_dir / "metrics.json")
-        validate_candidate_cutoff(
-            control_metrics,
-            100,
-            artifact_name="Top100 control reranker metrics",
-        )
-        control_config = load_json_object(top100_control_rerank_run_dir / "run_config.json")
-        control_hybrid_run_dir = load_control_hybrid_run_dir(control_config)
-        control_hybrid_metrics = load_json_object(control_hybrid_run_dir / "metrics.json")
-        validate_fair_top100_control(
+        control_metrics, control_traces, control_hybrid_run_dir = load_optional_top100_control(
+            top100_control_rerank_run_dir,
             first_hop_metrics=first_hop_metrics,
-            control_hybrid_metrics=control_hybrid_metrics,
-        )
-        control_traces = load_rerank_trace_lookup(
-            top100_control_rerank_run_dir / "rerank_traces.jsonl"
         )
         validate_qid_sets(candidate_rows, baseline_traces, control_traces)
         reranker = reranker or CrossEncoderReranker(
@@ -259,8 +247,14 @@ def run_rule_second_hop_eval(
         run_config={
             "first_hop_hybrid_run_dir": str(first_hop_hybrid_run_dir),
             "baseline_rerank_run_dir": str(baseline_rerank_run_dir),
-            "top100_control_rerank_run_dir": str(top100_control_rerank_run_dir),
-            "top100_control_hybrid_run_dir": str(control_hybrid_run_dir),
+            "top100_control_rerank_run_dir": (
+                str(top100_control_rerank_run_dir)
+                if top100_control_rerank_run_dir is not None
+                else None
+            ),
+            "top100_control_hybrid_run_dir": (
+                str(control_hybrid_run_dir) if control_hybrid_run_dir is not None else None
+            ),
             "chunks_path": str(chunks_path),
             "index_dir": str(index_dir),
             "dense_model_name": dense_model_name,
@@ -328,6 +322,15 @@ def load_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
+def optional_artifact_path(value: str | Path | None) -> Path | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.casefold() in {"none", "null", "skip"}:
+        return None
+    return Path(text)
+
+
 def validate_candidate_cutoff(
     metrics: dict[str, Any],
     expected: int,
@@ -374,6 +377,32 @@ def validate_fair_top100_control(
             )
 
 
+def load_optional_top100_control(
+    top100_control_rerank_run_dir: Path | None,
+    *,
+    first_hop_metrics: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]] | None, Path | None]:
+    if top100_control_rerank_run_dir is None:
+        return None, None, None
+    control_metrics = load_json_object(top100_control_rerank_run_dir / "metrics.json")
+    validate_candidate_cutoff(
+        control_metrics,
+        100,
+        artifact_name="Top100 control reranker metrics",
+    )
+    control_config = load_json_object(top100_control_rerank_run_dir / "run_config.json")
+    control_hybrid_run_dir = load_control_hybrid_run_dir(control_config)
+    control_hybrid_metrics = load_json_object(control_hybrid_run_dir / "metrics.json")
+    validate_fair_top100_control(
+        first_hop_metrics=first_hop_metrics,
+        control_hybrid_metrics=control_hybrid_metrics,
+    )
+    control_traces = load_rerank_trace_lookup(
+        top100_control_rerank_run_dir / "rerank_traces.jsonl"
+    )
+    return control_metrics, control_traces, control_hybrid_run_dir
+
+
 def load_rerank_trace_lookup(path: Path) -> dict[str, dict[str, Any]]:
     if not path.exists():
         raise RuleSecondHopEvalError(f"Missing required artifact: {path}")
@@ -396,13 +425,13 @@ def load_rerank_trace_lookup(path: Path) -> dict[str, dict[str, Any]]:
 def validate_qid_sets(
     candidate_rows: list[dict[str, Any]],
     baseline_traces: dict[str, dict[str, Any]],
-    control_traces: dict[str, dict[str, Any]],
+    control_traces: dict[str, dict[str, Any]] | None,
 ) -> None:
     candidate_qids = {row["qid"] for row in candidate_rows}
-    for label, qids in (
-        ("baseline reranker traces", set(baseline_traces)),
-        ("top100 control reranker traces", set(control_traces)),
-    ):
+    qid_sets = [("baseline reranker traces", set(baseline_traces))]
+    if control_traces is not None:
+        qid_sets.append(("top100 control reranker traces", set(control_traces)))
+    for label, qids in qid_sets:
         if qids != candidate_qids:
             raise RuleSecondHopEvalError(
                 f"Qid set mismatch between first-hop candidates and {label}: "
@@ -601,7 +630,7 @@ def summarize_second_hop_traces(
     ks: list[int],
     merged_candidate_upper_bound: int,
     baseline_metrics: dict[str, Any],
-    control_metrics: dict[str, Any],
+    control_metrics: dict[str, Any] | None,
 ) -> dict[str, Any]:
     valid_rows = [trace for trace in traces if trace["case_type"] != CASE_INVALID]
     summary = summarize_chunk_metrics(
@@ -738,7 +767,9 @@ def render_comparison_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def comparison_row(label: str, metrics: dict[str, Any]) -> list[Any]:
+def comparison_row(label: str, metrics: dict[str, Any] | None) -> list[Any]:
+    if metrics is None:
+        return [label, "N/A", "N/A", "N/A", "N/A"]
     return [
         label,
         f"{float(metrics['chunk_full_article_hit@10']):.4f}",
