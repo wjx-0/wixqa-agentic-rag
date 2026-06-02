@@ -100,6 +100,9 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
         self.assertIn("next_queries must target blocking_missing_evidence", prompt)
         self.assertIn("not merely rewrite the original question", prompt)
         self.assertIn("Do not trigger retrieval for nice-to-have details", prompt)
+        self.assertIn("decompose the question into required facets", prompt)
+        self.assertIn("top10 evidence must directly cover every required facet", prompt)
+        self.assertIn("Do not downgrade a missing required facet", prompt)
 
     def test_parse_fenced_json_and_normalizes_queries(self) -> None:
         parsed = parse_checker_response(
