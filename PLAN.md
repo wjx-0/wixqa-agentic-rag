@@ -642,23 +642,43 @@ multi-article article_full_hit@10_chunks
 
 因为 Agentic RAG 主要应该提升多文档问题。
 
-根据 error analysis，优先处理候选池本身缺少证据的 C 类：
+根据 error analysis，强 baseline 的失败可以拆成两类：
 
 ```text
 B_top50_chunks_full_not_top10_chunks
   -> 候选池已有完整证据
-  -> 暂不单独增加 selection 阶段
+  -> 问题主要在最终上下文选择 / 覆盖控制
 
 C_top50_chunks_not_full
   -> 候选池本身缺少证据
-  -> 使用 Phase 7 Rule-based Second-hop Retrieval
+  -> 问题主要在缺口诊断 / 补检索
 ```
 
-后续先实现 Phase 7 Rule-based Second-hop Retrieval，验证补检索能否提升 multi-article coverage。
+Phase 6 之后保留两条路线：
+
+```text
+Route A / Previous Branch
+  -> Rule second-hop
+  -> LLM checker gap query
+  -> merged-pool rerank
+  -> 作为对照实验和经验保留
+
+Route B / New Main Branch
+  -> Evidence Context Construction
+  -> Evidence Gap Diagnosis
+  -> Iterative Evidence Completion Loop
+  -> Shared Context Budget Manager / Auto-Compaction
+  -> Citation-aware Answer / Verifier
+  -> Multi-turn User Dialogue
+```
+
+新的主线不再把目标简化为“扩大 merged pool 后重新 rerank”，而是维护一个显式的 `EvidenceContext`：记录当前上下文已经支持哪些事实、缺哪些证据面、每轮检索补到了什么、什么时候足够回答，以及回答前如何压缩成可引用的 answer-ready context。
 
 ---
 
-# Phase 7: Rule-based Second-hop Retrieval
+# Route A / Previous Branch - Phase 7A: Rule-based Second-hop Retrieval
+
+> 该路线已经实现，用作旧方案对照和失败经验保留；不再作为后续主线继续扩展。
 
 ## 目标
 
@@ -760,7 +780,9 @@ outputs/rule_second_hop/
 
 ---
 
-# Phase 8: LLM Evidence Sufficiency Checker + Pool-level Gap Query Eval
+# Route A / Previous Branch - Phase 8A: LLM Evidence Sufficiency Checker + Pool-level Gap Query Eval
+
+> 该路线只做 pool-level gap query eval，不维护显式上下文状态；保留为 Route B 的对照基线。
 
 ## 目标
 
@@ -895,7 +917,9 @@ source_A_unnecessary_retrieval_count 越低越好
 
 ---
 
-# Phase 9: LLM Gap-query Merged Pool Rerank Loop
+# Route A / Previous Branch - Phase 9A: LLM Gap-query Merged Pool Rerank Loop
+
+> 该路线验证“补进 pool 的证据是否能被 reranker 推入 top10”。当前结果说明，纯 merged-pool rerank 对 multi-article evidence coverage 的提升有限，因此后续转向 Route B。
 
 ## 目标
 
@@ -1015,12 +1039,989 @@ pool_rescued_but_top20_only_count
 ```text
 若 top20 rescue 明显高于 top10 rescue，下一步优先优化 reranker / selection。
 若 top10 和 top20 rescue 都低，下一步继续优化 gap queries 或 candidate precision。
-若 multi full@10 提升且 LLM_C_top10_rescued_count > A_dropped@10_count，保留该流程作为 Agentic RAG 主线。
+若 multi full@10 提升且 LLM_C_top10_rescued_count > A_dropped@10_count，保留该流程作为 Route A 对照增强，但不覆盖 Route B 主线。
 ```
 
 ---
 
-# Phase 10: Citation-aware Answer Generation
+# Route B / New Main Branch - Evidence Context Loop
+
+## 路线定位
+
+Route B 从 Phase 6 重新分叉，目标是把系统从：
+
+```text
+retrieve / rerank / merged pool
+```
+
+升级为：
+
+```text
+retrieve
+  -> build evidence context
+  -> diagnose missing facets
+  -> generate targeted queries
+  -> retrieve more evidence
+  -> update evidence context
+  -> pack / compress answer-ready context
+  -> answer / verify
+  -> continue multi-turn dialogue
+```
+
+核心变化：
+
+```text
+旧路线关注 candidate_pool 是否补齐 gold articles。
+新路线关注 EvidenceContext 是否足以支持完整答案。
+```
+
+`gold_article_ids`、`case_type`、`missing_articles_at_*` 仍然只用于离线评测，不进入运行时 checker、query generation、packer 或 compressor。
+
+## 可追溯性硬约束
+
+Route B 必须做成可追溯答案系统。系统不记录或暴露模型的隐藏 chain-of-thought，但必须记录结构化 provenance：
+
+```text
+1. 每一次 LLM 调用都要有 PromptManifest。
+2. PromptManifest 必须记录模型实际看过的 chunk_id、article_id、snippet_id、compressed_context_id。
+3. 每个 missing_facet 必须记录它是基于哪些已见 chunk 判断出来的。
+4. 每条 next_query 必须记录 target_missing_facet 和 derived_from_chunk_ids。
+5. 每次 context compression 必须记录压缩前后的 source_chunk_ids 映射。
+6. 最终 answer generation 必须记录大模型实际看过哪些 chunk_id / compressed summaries。
+7. 每个答案 claim 尽量记录 supporting_chunk_ids 和 citation ids。
+8. verifier 必须记录它检查了哪些 answer claims 和哪些 evidence ids。
+```
+
+新增通用追踪对象：
+
+```text
+PromptManifest:
+  llm_call_id
+  phase                         # gap_diagnosis | query_generation | compression | answer | verifier
+  qid / conversation_id / turn_id
+  input_chunk_ids
+  input_article_ids
+  input_snippet_ids
+  input_compressed_context_ids
+  input_query_history_ids
+  output_object_id
+  prompt_token_count
+  output_token_count
+  schema_version
+
+GapQueryProvenance:
+  query_id
+  query_text
+  target_missing_facet
+  checker_call_id
+  derived_from_chunk_ids
+  derived_from_compressed_context_ids
+  blocking_missing_evidence
+
+AnswerProvenance:
+  answer_call_id
+  seen_chunk_ids
+  seen_compressed_context_ids
+  answer_claims
+  claim_support_map              # claim_id -> supporting_chunk_ids / citation_ids
+```
+
+这些 provenance 字段是运行时 trace 的一部分，不是只在评测阶段补出来。
+
+---
+
+# Route B - Phase 7B: Evidence Context Construction
+
+## 目标
+
+先不重新调用 LLM，也不重新检索。基于已有 Hybrid / Reranker / Error Analysis 输出中的 chunk-level traces，以 `chunk_id` 为基本证据追踪单位构建显式 `EvidenceContext`，把“当前上下文”从隐式 top10 chunks 改成可追踪状态对象。
+
+## 输入
+
+```text
+outputs/rerank_baseline/.../rerank_traces.jsonl
+outputs/hybrid_rrf_baseline/.../candidates.jsonl
+outputs/error_analysis/case_traces_top50_chunks.jsonl
+data/processed/wix_kb_chunks.jsonl
+```
+
+其中 Reranker 输出提供初始 active chunks，Hybrid 输出提供候选 chunks，`wix_kb_chunks.jsonl` 提供 chunk 文本和元信息；Phase 6 的 case_type 和 gold labels 只用于离线评测与诊断，不进入运行时 prompt。
+
+## 新增模块
+
+```text
+src/agentic/
+  __init__.py
+  evidence_context.py
+  provenance.py
+  context_budget.py
+  context_packer.py
+  context_compressor.py
+  dialogue_state.py
+```
+
+第一版数据结构：
+
+```python
+EvidenceItem:
+  chunk_id
+  article_id
+  snippet_id
+  title
+  text_preview
+  source                 # first_hop | second_hop | packed
+  first_hop_rank
+  rerank_rank
+  rerank_score
+  second_hop_query_ids
+  token_span
+  content_hash
+  active
+  visible_to_llm_call_ids
+
+EvidenceContext:
+  qid
+  question
+  round_index
+  candidate_items
+  active_items
+  packed_items
+  compressed_summary
+  query_history
+  known_facts
+  required_facets
+  covered_facets
+  missing_facets
+  prompt_manifests
+  gap_query_provenance
+  answer_provenance
+```
+
+`gold_article_ids` 可以保存在 trace 的 `eval` 子对象中，但不得进入 context prompt。
+
+## 输出
+
+```text
+outputs/evidence_context/
+  <hybrid_run_name>/
+    <rerank_run_name>/
+      initial_context/
+        run_config.json
+        metrics.json
+        metrics.md
+        evidence_context_traces.jsonl
+        cases_B_context_not_full.jsonl
+        cases_C_context_not_full.jsonl
+        multi_cases_context_not_full.jsonl
+```
+
+## 验收标准
+
+```text
+1. 能从现有 artifacts 重建 200 条 EvidenceContext。
+2. active_items 默认等于 baseline reranker top10。
+3. context metrics 与 Phase 5 reranker top10 指标一致。
+4. 每条 trace 能同时看到 active context、candidate pool、case type、article diversity。
+5. 每条 trace 都包含 initial PromptManifest，记录 baseline active_items 的 chunk_id。
+```
+
+---
+
+# Route B - Phase 8B: Evidence Gap Diagnosis
+
+## 目标
+
+将 checker 从“证据是否 sufficient + missing_evidence”升级为“上下文覆盖了哪些 required facets、缺哪些 facets”。
+
+## Checker 输入
+
+```text
+question
+current EvidenceContext.active_items
+optional query_history
+optional previous missing_facets
+```
+
+不得输入：
+
+```text
+gold_article_ids
+case_type
+missing_articles_at_10_chunks
+missing_articles_at_50_chunks
+gold answer
+```
+
+## Checker 输出 JSON
+
+```json
+{
+  "sufficient": false,
+  "seen_chunk_ids": [],
+  "required_facets": [
+    {
+      "facet_id": "facet_1",
+      "facet": "string",
+      "why_required": "string"
+    }
+  ],
+  "covered_facets": [
+    {
+      "facet_id": "facet_1",
+      "facet": "string",
+      "supporting_chunk_ids": [],
+      "supporting_fact": "string"
+    }
+  ],
+  "missing_facets": [
+    {
+      "facet_id": "facet_2",
+      "facet": "string",
+      "inferred_from_chunk_ids": [],
+      "why_missing": "string"
+    }
+  ],
+  "known_facts": [
+    {
+      "fact": "string",
+      "source_chunk_ids": []
+    }
+  ],
+  "blocking_missing_evidence": [
+    {
+      "facet_id": "facet_2",
+      "missing_evidence": "string",
+      "inferred_from_chunk_ids": []
+    }
+  ],
+  "next_queries": [
+    {
+      "query_id": "gap_query_1",
+      "query_text": "string",
+      "target_missing_facet_id": "facet_2",
+      "derived_from_chunk_ids": []
+    }
+  ],
+  "reason": ""
+}
+```
+
+字段含义：
+
+```text
+required_facets
+  问题要被完整回答时必须覆盖的证据面，例如对象、动作、条件、步骤、限制、适用产品。
+
+covered_facets
+  当前 active context 已经直接支持的证据面。
+
+missing_facets
+  当前 active context 未覆盖且会影响答案完整性的证据面。
+
+next_queries
+  只针对 missing_facets / blocking_missing_evidence，不做单纯 paraphrase。
+```
+
+`seen_chunk_ids` 必须等于本次 checker PromptManifest 中的 `input_chunk_ids`。如果 checker 输出的 `supporting_chunk_ids`、`inferred_from_chunk_ids` 或 `derived_from_chunk_ids` 引用了未出现在 `seen_chunk_ids` 中的 chunk，视为 invalid trace。
+
+## 输出
+
+```text
+outputs/evidence_gap_diagnosis/
+  <context_run_name>/
+    qwen3_8b_facet_checker/
+      run_config.json
+      metrics.json
+      metrics.md
+      gap_diagnosis_traces.jsonl
+      prompt_manifests.jsonl
+      gap_query_provenance.jsonl
+      cases_checker_invalid_json.jsonl
+      cases_invalid_provenance_refs.jsonl
+      cases_missing_facets.jsonl
+      cases_source_A_marked_insufficient.jsonl
+      cases_source_C_marked_sufficient.jsonl
+```
+
+## 验收标准
+
+```text
+checker_valid_count 接近 200
+source_A_sufficient_rate 尽量高
+source_C_sufficient_count 尽量低
+avg_missing_facets 可解释
+next_queries 与 missing_facets 对齐
+checker_seen_chunk_manifest_rate 接近 1.0
+gap_query_provenance_rate 接近 1.0
+invalid_provenance_ref_count = 0
+```
+
+本阶段仍然不追求最终 top10 提升，目标是把“缺口”从自然语言 missing evidence 升级成可追踪 facets。
+
+---
+
+# Route B - Phase 9B: Iterative Evidence Completion Loop
+
+## 目标
+
+实现真正的上下文循环，而不是一次性 second-hop。
+
+```text
+for round in 0..max_rounds:
+  build ContextUsageSnapshot
+  pack / auto-compact context if projected usage exceeds thresholds
+  diagnose EvidenceContext
+  if sufficient:
+    stop and go to answer generation
+  build ContextUsageSnapshot for query generation
+  pack / auto-compact query-generation context if needed
+  generate next_queries
+  retrieve each query
+  rerank new candidates with Qwen/Qwen3-Reranker-0.6B
+  select top5 new chunks for next LLM-visible context
+  update EvidenceContext
+```
+
+## 默认配置
+
+```text
+max_rounds = 4
+max_queries_per_round = 2
+second_hop_top_k_chunks = 20 per query, stored in candidate_items
+branch_top_k_chunks = 100
+rrf_k = 60
+bm25_weight = 1
+dense_weight = 2
+max_raw_chunks_per_checker_call = 10
+new_candidate_reranker = Qwen/Qwen3-Reranker-0.6B
+max_new_raw_chunks_per_round = 5
+```
+
+检索和给模型看的数量分开：
+
+```text
+retrieve:
+  每条 gap query 检索 fused top20 chunks，全部写入 EvidenceContext.candidate_items。
+
+rerank new candidates:
+  合并本轮最多 2 条 query 的新增候选，按 chunk_id 去重。
+  使用 Qwen/Qwen3-Reranker-0.6B 对新增候选重新排序。
+  选择 top5 new chunks 进入下一次 LLM 可见上下文。
+
+shortlist for LLM:
+  每轮最多给 LLM 新看 5 个 raw chunks。
+  checker / query-generation 每次最多看 10 个 raw chunks。
+  旧 evidence 可以通过 compressed_summary / known_facts 累积，因此模型可以越跑掌握越多上下文，但每次 raw chunks 仍受限。
+```
+
+这样做的原因：
+
+```text
+top20 per query 用于保证召回，不直接增加 LLM 成本。
+0.6B reranker 用于低成本筛选新增证据。
+每轮 top5 new chunks 控制 checker 成本。
+每次 raw chunks <= 10，但 compressed context 可累积历史证据。
+```
+
+## Context Update 原则
+
+```text
+1. 所有候选按 chunk_id 去重。
+2. 保留 first_hop_rank、second_hop_query_ids、second_hop_ranks。
+3. query_history 防止重复查询。
+4. 每轮记录 new_chunk_ids、new_article_ids、new_gold_article_ids 仅用于 eval。
+5. active_items 随 EvidenceContext 更新；Shared Layer 10B 负责每次 LLM call 前的 packing / auto-compaction。
+6. 每轮记录 checker_call_id、checker_seen_chunk_ids、gap_query_provenance、retrieved_chunk_ids、new_candidate_rerank_top5_chunk_ids、active_chunk_ids_after_update。
+7. 每次 checker / query-generation LLM call 前都必须经过 Context Budget Manager。
+8. LLM 可见的 active_items 是 packer 产物，不等于 candidate_items；新检索 top20 只进候选池，未经 shortlist 不直接给 LLM 看。
+```
+
+每轮 trace 至少包含：
+
+```json
+{
+  "round_index": 1,
+  "checker_call_id": "llm_call_...",
+  "checker_seen_chunk_ids": [],
+  "missing_facets": [],
+  "gap_queries": [],
+  "gap_query_provenance": [],
+  "retrieved_chunk_ids_by_query": {},
+  "new_candidate_reranker": "Qwen/Qwen3-Reranker-0.6B",
+  "new_candidate_rerank_top5_chunk_ids": [],
+  "new_active_chunk_ids": [],
+  "active_chunk_ids_after_update": [],
+  "stopped_because_sufficient": false
+}
+```
+
+## 输出
+
+```text
+outputs/evidence_context_loop/
+  <context_run_name>/
+    qwen3_8b_facet_loop_s3_h20_r3/
+      run_config.json
+      metrics.json
+      metrics.md
+      context_loop_traces.jsonl
+      round_traces.jsonl
+      prompt_manifests.jsonl
+      gap_query_provenance.jsonl
+      cases_context_pool_rescued.jsonl
+      multi_cases_context_pool_rescued.jsonl
+      cases_stopped_sufficient.jsonl
+      cases_max_rounds_not_sufficient.jsonl
+```
+
+## 核心指标
+
+```text
+avg_llm_calls
+avg_retrieval_rounds
+avg_generated_queries
+avg_candidate_items
+context_pool_full_article_hit_rate
+multi_context_pool_full_article_hit_rate
+C_context_pool_rescued_count
+multi_C_context_pool_rescued_count
+source_A_unnecessary_loop_count
+round_prompt_manifest_rate
+gap_query_provenance_rate
+retrieval_provenance_rate
+```
+
+验收标准：
+
+```text
+1. C_context_pool_rescued_count 明显优于 Route A Phase 7A/8A。
+2. multi_C_context_pool_rescued_count 有提升。
+3. source_A_unnecessary_loop_count 可控。
+4. 每轮 trace 能解释为什么继续检索、检索了什么、上下文更新了什么。
+5. 每条 gap query 都能回溯到 checker_call_id、target_missing_facet 和 derived_from_chunk_ids。
+```
+
+---
+
+# Route B - Shared Layer 10B: Context Budget Manager, Packing & Auto-Compaction
+
+## 目标
+
+Context packing / compression 不是最后回答前才做，而是每次 LLM 调用前都运行的共享层。
+
+这一层的职责不是“刷 top10”，而是：
+
+```text
+1. 估算本次 LLM 调用的 projected context usage。
+2. 在达到阈值时自动压缩旧 evidence / dialogue memory。
+3. 为 checker / query generation / answer / verifier 分别打包 prompt packet。
+4. 保留关键证据和 citation provenance。
+5. 写入 PromptManifest 和 compact_boundary trace。
+```
+
+Packing 每次 LLM 调用前都执行；compression 只在上下文预算接近阈值时自动触发，或由调试命令手动触发。
+
+适用阶段：
+
+```text
+Phase 8B checker 前
+Phase 9B 每轮 query generation / checker 前
+Phase 11B answer / verifier 前
+Phase 12B multi-turn dialogue 每轮前
+```
+
+## Packer 输入
+
+```text
+question
+EvidenceContext.candidate_items
+EvidenceContext.active_items
+known_facts
+required_facets / covered_facets / missing_facets
+query_history
+citation provenance
+token_budget
+```
+
+## LLM 可见 Chunk 策略
+
+第一次 checker 调用：
+
+```text
+只给模型看 baseline reranker top10 chunks。
+PromptManifest.input_chunk_ids = baseline_top10_chunk_ids。
+```
+
+后续 checker / query-generation 调用：
+
+```text
+raw_chunk_budget = 10
+max_new_raw_chunks_per_round = 5
+new_chunk_selector = Qwen/Qwen3-Reranker-0.6B top5 over this round's retrieved candidates
+max_chunks_per_article_in_prompt = 2
+```
+
+选择顺序：
+
+```text
+1. 保留已覆盖关键 covered_facets 的旧 chunks。
+2. 保留最近一轮经 0.6B reranker 选出的 top5 new chunks。
+3. 对同一 article 的重复 chunks 降权，最多保留 2 个。
+4. 未进入 raw prompt 的旧证据进入 compressed_summary / known_facts，但必须保留 source_chunk_ids。
+5. 每次 LLM 可见 raw chunks 总数不得超过 10，除非 answer 阶段明确提高预算并写入 run_config。
+```
+
+Answer / verifier 阶段默认仍使用：
+
+```text
+max_raw_chunks_per_answer_call = 10
+```
+
+如果后续发现 answer 质量需要更多证据，再单独做 ablation，而不是默认放宽。
+
+## Context Budget 计算
+
+每次 LLM 调用前先构建 `ContextUsageSnapshot`：
+
+```text
+model_context_window_tokens
+reserved_output_tokens
+safety_margin_tokens
+usable_input_budget
+static_instruction_tokens
+task_prompt_tokens
+dialogue_memory_tokens
+evidence_tokens
+compressed_context_tokens
+query_history_tokens
+tool_or_schema_tokens
+projected_input_tokens
+projected_total_tokens = projected_input_tokens + reserved_output_tokens
+usage_ratio = projected_total_tokens / model_context_window_tokens
+```
+
+默认预算：
+
+```text
+reserved_output_ratio = 0.12
+safety_margin_ratio = 0.03
+usable_input_budget = model_context_window_tokens
+  - reserved_output_tokens
+  - safety_margin_tokens
+```
+
+所有阈值都基于 `projected_total_tokens / model_context_window_tokens`，而不是只看已经累计的 history tokens。
+
+## Auto-Compaction 阈值策略
+
+参考 Claude Code：
+
+```text
+Claude Code 会在接近上下文限制时自动 compaction；
+官方成本文档提到 auto-compaction 会摘要 conversation history；
+Claude Code SDK 的 /compact 会产生 compact_boundary，并记录 pre-compaction tokens 和 trigger。
+```
+
+本项目采用更保守的 RAG 版本，因为长 evidence context 会影响 checker / answer 的精度：
+
+| usage_ratio | 状态 | 动作 |
+| ---: | --- | --- |
+| `< 0.70` | healthy | 只做 packing，不压缩 |
+| `0.70 - 0.80` | watch | 去重、裁剪 inactive duplicates，记录 warning |
+| `>= 0.80` | soft_auto_compact | 自动压缩旧轮次 evidence、低价值重复 chunks、旧 dialogue turns |
+| `>= 0.90` | hard_auto_compact | 本次 LLM call 前必须压缩到目标比例以下 |
+| `>= 0.95` | emergency_compact | 参考 Claude Code auto-compact 临界思路；若压缩后仍超限，则拆分子调用或拒绝本次 LLM call |
+
+压缩目标：
+
+```text
+target_after_compact_ratio = 0.60
+min_compaction_savings_ratio = 0.15
+max_raw_recent_turns_to_keep = 2
+max_raw_recent_rounds_to_keep = 1
+```
+
+也就是说，触发自动压缩后，不是刚好压到 79%，而是尽量压回 60% 左右，避免下一轮马上再次压缩。
+
+## Manual Compact
+
+保留一个手动压缩入口，类似 Claude Code `/compact Focus on ...`：
+
+```text
+manual_compact(focus_instructions)
+```
+
+示例：
+
+```text
+Focus on missing facets, source_chunk_ids, citation manifest, and user constraints.
+```
+
+手动压缩和自动压缩都要写相同的 `CompactBoundary` trace。
+
+## CompactBoundary Trace
+
+每次压缩都记录：
+
+```text
+compact_boundary_id
+trigger                       # manual | soft_auto | hard_auto | emergency
+phase                         # checker | query_generation | answer | verifier | dialogue
+pre_compaction_tokens
+post_compaction_tokens
+pre_usage_ratio
+post_usage_ratio
+target_after_compact_ratio
+focus_instructions
+source_chunk_ids
+kept_raw_chunk_ids
+compressed_context_ids
+dropped_chunk_ids
+source_to_summary_map
+provenance_retention_check
+created_at_round
+created_at_turn
+```
+
+## Claude Code 式上下文压缩参考
+
+Claude Code 的上下文管理思路是：会把长会话压缩成结构化摘要以释放上下文空间，`/compact` 还可以带 focus instructions；官方文档也强调，压缩后项目级持久规则会重新注入，而历史对话会被摘要替代。
+
+本项目借鉴这个思路，但应用到 RAG evidence context：
+
+```text
+raw evidence chunks
+  -> structured evidence summary
+  -> preserve citations / article_ids / urls / chunk_ids
+  -> keep recent or decisive raw snippets
+  -> drop duplicates and low-value repetition
+```
+
+压缩后的 `ContextCompression` 至少包含：
+
+```text
+compressed_context_id
+question_intent
+known_facts
+covered_facets
+remaining_missing_facets
+evidence_summary_by_article
+citation_manifest              # article_id, title, url, chunk_ids
+raw_snippets_to_keep
+source_chunk_ids
+source_snippet_ids
+summary_support_map            # summary sentence -> source_chunk_ids
+query_history
+compression_reason
+token_budget_before_after
+```
+
+压缩原则：
+
+```text
+1. 不压缩掉 citation provenance。
+2. 不压缩掉 checker 判定 sufficient 所依赖的关键事实。
+3. 对同一 article 的重复 chunks 做摘要合并。
+4. 最近一轮新增证据优先保留 raw snippet。
+5. 如果压缩后 verifier 判断支持不足，回退到未压缩 context 或重新检索。
+6. 每次 compression 都写 trace，方便审计丢了什么。
+7. compressed summary 的每句话都要能回溯到 source_chunk_ids。
+```
+
+## Packing / Compression 策略
+
+```text
+如果 active context 在 token budget 内：
+  只做去重和 citation manifest，不做 LLM compression。
+
+如果 active context 超出 token budget：
+  先按 article / facet 聚合，再做结构化摘要压缩。
+
+如果多轮对话积累了旧上下文：
+  保留当前 turn 相关 raw snippets，把旧 turn evidence 压成 session memory summary。
+```
+
+## 输出
+
+```text
+outputs/evidence_context_packing/
+  <loop_run_name>/
+    context_budget_v1/
+      run_config.json
+      metrics.json
+      metrics.md
+      context_usage_snapshots.jsonl
+      compact_boundaries.jsonl
+      answer_ready_context_traces.jsonl
+      context_compression_traces.jsonl
+      prompt_manifests.jsonl
+      compression_source_maps.jsonl
+      cases_compression_used.jsonl
+      cases_verifier_failed_after_compression.jsonl
+      cases_context_packed_without_compression.jsonl
+```
+
+## 核心指标
+
+```text
+answer_ready_context_sufficient_rate
+avg_context_tokens_before
+avg_context_tokens_after
+avg_usage_ratio_before
+avg_usage_ratio_after
+auto_compaction_count
+manual_compaction_count
+emergency_compaction_count
+compression_token_reduction_ratio
+citation_retention_rate
+facet_retention_rate
+verifier_supported_context_rate
+compression_verifier_failure_count
+compression_source_map_rate
+summary_sentence_support_rate
+compact_boundary_trace_rate
+```
+
+离线诊断可额外报告：
+
+```text
+packed_context_full_article_hit@10
+multi_packed_context_full_article_hit@10
+packed_context_unique_articles@10
+```
+
+验收标准：
+
+```text
+1. sufficient 的 EvidenceContext 能被整理成 answer-ready context。
+2. compression 后 verifier 仍能确认上下文支持答案。
+3. citation_retention_rate 接近 1.0。
+4. token 数明显下降时，facet_retention_rate 不明显下降。
+5. 每个 compressed_context_id 都能列出 source_chunk_ids。
+6. hard_auto_compact 触发后，post_usage_ratio 应低于 target_after_compact_ratio 或明确记录无法压缩原因。
+```
+
+---
+
+# Route B - Phase 11B: Citation-aware Answer Generation / Verifier
+
+## 目标
+
+当 checker 判断 EvidenceContext sufficient，并经过 Phase 10B 打包 / 压缩后，直接生成带引用答案。答案生成不再依赖固定 top10，而依赖 answer-ready context。
+
+## Pipeline
+
+```text
+question
+answer-ready EvidenceContext
+  -> build answer PromptManifest with seen_chunk_ids / seen_compressed_context_ids
+  -> citation-aware answer
+  -> verifier checks answer support
+  -> answer / abstain / return to evidence loop
+```
+
+## 输出
+
+```text
+outputs/evidence_answering/
+  <packing_run_name>/
+    answer_generation/
+      run_config.json
+      answer_traces.jsonl
+      verifier_traces.jsonl
+      prompt_manifests.jsonl
+      answer_provenance.jsonl
+      metrics.md
+```
+
+## Answer 输出 JSON
+
+```json
+{
+  "answer": "string",
+  "seen_chunk_ids": [],
+  "seen_compressed_context_ids": [],
+  "answer_claims": [
+    {
+      "claim_id": "claim_1",
+      "claim": "string",
+      "supporting_chunk_ids": [],
+      "supporting_compressed_context_ids": [],
+      "citation_ids": []
+    }
+  ],
+  "citations": [
+    {
+      "citation_id": "src_1",
+      "article_id": "string",
+      "chunk_ids": [],
+      "title": "string",
+      "url": "string"
+    }
+  ]
+}
+```
+
+`seen_chunk_ids` 必须来自 answer PromptManifest。答案里出现的 citation / claim support 不得引用模型没有看过的 chunk。
+
+## Verifier 输出
+
+```json
+{
+  "status": "ready_to_answer | insufficient_evidence | unsupported_answer",
+  "reason": "string",
+  "verifier_seen_chunk_ids": [],
+  "checked_claim_ids": [],
+  "unsupported_claims": [],
+  "missing_facets": [],
+  "suggested_queries": []
+}
+```
+
+Verifier 决策：
+
+```text
+ready_to_answer
+  -> 返回带引用答案。
+
+insufficient_evidence
+  -> 回到 Phase 9B，使用 missing_facets / suggested_queries 继续补证据。
+
+unsupported_answer
+  -> 重新生成答案；若仍失败，则拒答或请求人工确认。
+```
+
+验收标准：
+
+```text
+answer_seen_chunk_manifest_rate 接近 1.0
+claim_support_map_rate 尽量高
+invalid_answer_support_ref_count = 0
+verifier_seen_chunk_manifest_rate 接近 1.0
+```
+
+---
+
+# Route B - Phase 12B: Multi-turn User Dialogue
+
+## 目标
+
+实现用户多轮对话，使系统不仅能回答单个 WixQA 问题，还能在连续追问中复用、更新、压缩上下文。
+
+多轮对话的核心不是每轮重新 RAG，而是维护 `DialogueState`：
+
+```text
+DialogueState:
+  conversation_id
+  user_turns
+  assistant_turns
+  current_user_intent
+  active_question
+  rewritten_standalone_question
+  evidence_context
+  context_memory_summary
+  answer_history
+  citation_history
+  prompt_manifest_history
+  evidence_visibility_history
+  unresolved_user_constraints
+  pending_clarification_questions
+```
+
+## 多轮流程
+
+```text
+user message
+  -> classify turn type
+  -> rewrite follow-up into standalone question if needed
+  -> decide answer from existing EvidenceContext or retrieve more
+  -> update EvidenceContext
+  -> build ContextUsageSnapshot
+  -> auto-compact when projected usage crosses thresholds
+  -> pack / compress context if budget pressure is high
+  -> answer / ask clarification / abstain
+  -> write turn-level PromptManifest and AnswerProvenance
+```
+
+Turn type：
+
+```text
+new_question
+follow_up_question
+clarification_answer
+correction_or_constraint
+topic_shift
+```
+
+## 上下文压缩策略
+
+参考 Claude Code 的 session / compact 思路，多轮对话中区分：
+
+```text
+short-term active context
+  当前 turn 和最近 turn 的 raw evidence、用户约束、未解决问题。
+
+long-term compact memory
+  已确认事实、已回答问题、保留引用、用户偏好和仍有效的约束。
+```
+
+当上下文接近预算上限时：
+
+```text
+1. 保留最近 N 轮原文。
+2. 将更早轮次压缩成 conversation_summary。
+3. citation_history 不丢失，只压缩展示文本。
+4. 未解决的 missing_facets / pending questions 不丢失。
+5. topic_shift 时启动新的 EvidenceContext，但保留用户明确约束。
+6. 每轮都记录当前回答实际复用了哪些 previous chunk_ids / compressed_context_ids。
+```
+
+## 输出
+
+```text
+outputs/dialogue_agent/
+  session_eval/
+    run_config.json
+    dialogue_traces.jsonl
+    context_memory_traces.jsonl
+    compression_traces.jsonl
+    prompt_manifests.jsonl
+    answer_provenance.jsonl
+    evidence_visibility_traces.jsonl
+    metrics.json
+    metrics.md
+```
+
+## 核心指标
+
+```text
+avg_turns
+avg_retrieval_rounds_per_turn
+memory_reuse_rate
+follow_up_rewrite_valid_rate
+clarification_request_count
+context_compression_count
+citation_continuity_rate
+unsupported_answer_count
+turn_prompt_manifest_rate
+turn_answer_seen_chunk_rate
+memory_source_retention_rate
+```
+
+第一版可以先构造少量 multi-turn synthetic cases：
+
+```text
+turn1: ask a Wix task question
+turn2: ask "what about for services instead of products?"
+turn3: add a constraint such as "I use Wix Bookings"
+turn4: ask for final steps
+```
+
+---
+
+# Legacy Common Phase: Citation-aware Answer Generation
+
+> 保留原计划中的答案生成目标作为历史说明；新主线以 Route B Phase 11B 为准，答案输入来自 answer-ready EvidenceContext，而不是固定 top-k articles。
 
 ## 目标
 
@@ -1078,7 +2079,7 @@ citation urls
 
 ---
 
-# Phase 11: Verifier / Abstention
+# Legacy Common Phase: Verifier / Abstention
 
 ## 目标
 
@@ -1115,7 +2116,7 @@ citation urls
 
 ---
 
-# Phase 12: Optional - Pairwise Evidence Reranker
+# Advanced Optional Phase: Pairwise Evidence Reranker
 
 ## 目标
 
@@ -1158,9 +2159,9 @@ score(question, article_a, article_b)
 
 ## 5. 推荐完成顺序
 
-## MVP 版本
+## 当前推荐 MVP 版本
 
-目标：尽快完成可写简历版本。
+目标：从 Phase 6 之后切到 Evidence Context Loop，先证明“上下文状态 + 缺口诊断 + 上下文打包压缩”比继续调 merged-pool rerank 更有效。
 
 ```text
 Phase 1: 数据接入与统计分析
@@ -1169,15 +2170,41 @@ Phase 3: Dense Retrieval Baseline
 Phase 4: Hybrid Retrieval with RRF
 Phase 5: Qwen3 Chunk Reranker Baseline
 Phase 6: Error Analysis & Trace Logging
-Phase 7: Rule-based Second-hop Retrieval
-Phase 8: LLM Evidence Sufficiency Checker
-Phase 9: LLM Gap-query Merged Pool Rerank Loop
+
+Route B Phase 7B: Evidence Context Construction
+Route B Phase 8B: Evidence Gap Diagnosis
+Route B Phase 9B: Iterative Evidence Completion Loop
+Route B Shared Layer 10B: Context Budget Manager / Auto-Compaction
+Route B Phase 11B: Citation-aware Answer / Verifier
+Route B Phase 12B: Multi-turn User Dialogue
 ```
 
-预计时间：
+第一阶段优先级：
 
 ```text
-4 - 7 天
+1. 先实现 Phase 7B，复用现有 reranker artifacts，不重新调用 LLM。
+2. 再实现 Phase 8B / 9B，让 checker 围绕 EvidenceContext 做缺口诊断和补证据循环。
+3. 然后实现 Shared Layer 10B，让每次 LLM call 前都能按阈值自动 packing / compaction。
+4. 最后接 Phase 11B 答案生成和 Phase 12B 多轮对话。
+```
+
+---
+
+## Route A 对照分支
+
+```text
+Route A Phase 7A: Rule-based Second-hop Retrieval
+Route A Phase 8A: LLM Evidence Checker Pool-level Eval
+Route A Phase 9A: LLM Gap-query Merged Pool Rerank
+```
+
+用途：
+
+```text
+保留旧路线结果，用于说明为什么需要 EvidenceContext：
+1. rule title expansion 只能补回少量 C 类 pool evidence；
+2. LLM gap query 可以改善 pool coverage，但不能保证进入 top10；
+3. 纯 reranker 仍然偏向单 chunk 相关性，不能稳定优化证据集合完整性。
 ```
 
 ---
@@ -1185,15 +2212,9 @@ Phase 9: LLM Gap-query Merged Pool Rerank Loop
 ## 完整企业化版本
 
 ```text
-MVP
-+ Phase 10: Citation-aware Answer Generation
-+ Phase 11: Verifier / Abstention
-```
-
-预计时间：
-
-```text
-7 - 10 天
+Route B MVP
++ Route B Phase 11B: Citation-aware Answer / Verifier
++ Route B Phase 12B: Multi-turn User Dialogue
 ```
 
 ---
@@ -1202,13 +2223,16 @@ MVP
 
 ```text
 完整企业化版本
-+ Phase 12: Pairwise Evidence Reranker
++ Advanced Optional Phase: Pairwise Evidence Reranker
 ```
 
-预计时间：
+可选增强：
 
 ```text
-2 - 3 周
+1. facet-aware chunk grounding
+2. article-level context packing
+3. pairwise / setwise evidence reranker
+4. dialogue-level memory and personalization
 ```
 
 ---
@@ -1218,13 +2242,13 @@ MVP
 完成后，简历可以写：
 
 ```text
-构建面向企业客服知识库的 Evidence-Completion Agentic RAG 系统，基于 WixQA 实现 BM25、Dense Retrieval、RRF Fusion、Cross-Encoder Reranker 等强检索基线，并针对多文档问题中支持文章召回不完整的问题，引入 Evidence Sufficiency Checker、Gap-aware Query Generation 和 Bounded Second-hop Retrieval，以 article_full_hit@k、article_recall@k、avg_llm_calls 和 agent trace 评估检索完整性与系统成本。
+构建面向企业客服知识库的可追溯 Evidence-Completion Agentic RAG 系统，基于 WixQA 实现 BM25、Dense Retrieval、RRF Fusion、Cross-Encoder Reranker 等强检索基线，并针对多文档问题中支持文章召回不完整的问题，设计 EvidenceContext 状态管理、facet-level Evidence Gap Diagnosis、Iterative Evidence Completion Loop、Context Budget Manager / Auto-Compaction 和多轮 DialogueState；通过 PromptManifest、GapQueryProvenance 和 AnswerProvenance 记录 checker / query generation / answer / verifier 实际看过的 chunk_id，以 evidence sufficiency、article_recall@k、multi-article coverage、context usage ratio、compression token reduction、claim_support_map_rate 和 agent trace 评估检索完整性、答案可追溯性与系统成本。
 ```
 
 如果最终加入答案生成，可以补充：
 
 ```text
-进一步实现 Citation-aware Answer Generation 和 Verifier / Abstention 机制，使系统在证据不足时能够拒答或提示人工确认，降低企业客服场景下的幻觉风险。
+进一步实现 Citation-aware Answer Generation、Verifier / Abstention 和多轮用户对话机制，使系统在证据不足时能够继续补证据、追问澄清或拒答，降低企业客服场景下的幻觉风险。
 ```
 
 ---
@@ -1240,21 +2264,24 @@ Phase 3: Dense Retrieval Baseline
 Phase 4: Hybrid Retrieval with RRF
 Phase 5: Qwen3 Chunk Reranker Baseline
 Phase 6: Error Analysis & Trace Logging
-Phase 7: Rule-based Second-hop Retrieval implementation
-Phase 8: LLM Evidence Checker pool-level eval implementation
-Phase 9: LLM Gap-query Merged Pool Rerank Loop implementation
+Route A Phase 7A: Rule-based Second-hop Retrieval implementation
+Route A Phase 8A: LLM Evidence Checker pool-level eval implementation
+Route A Phase 9A: LLM Gap-query Merged Pool Rerank Loop implementation
 ```
 
 ## Next
 
 ```text
-Phase 9: Server run over Phase 8 merged pools
+Route B Phase 7B: Evidence Context Construction
+Route B Phase 8B: Evidence Gap Diagnosis
+Route B Phase 9B: Iterative Evidence Completion Loop
+Route B Shared Layer 10B: Context Budget Manager / Auto-Compaction
 ```
 
 ## Planned
 
 ```text
-Phase 10: Citation-aware Answer Generation
-Phase 11: Verifier / Abstention
-Phase 12: Pairwise Evidence Reranker
+Route B Phase 11B: Citation-aware Answer / Verifier
+Route B Phase 12B: Multi-turn User Dialogue
+Advanced Optional Phase: Pairwise Evidence Reranker
 ```

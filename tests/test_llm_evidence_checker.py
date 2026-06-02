@@ -16,7 +16,9 @@ from src.evaluation.run_llm_evidence_checker_eval import (
 from src.llm.evidence_checker import (
     OpenAICompatibleChatClient,
     build_evidence_checker_messages,
+    build_traceable_evidence_checker_messages,
     parse_checker_response,
+    parse_traceable_checker_response,
 )
 from src.utils.io_utils import read_json, read_jsonl, write_json, write_jsonl
 
@@ -125,6 +127,76 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
         self.assertEqual(parsed["blocking_missing_evidence"], ["missing setup step"])
         self.assertEqual(parsed["nice_to_have_missing_evidence"], ["extra screenshot"])
         self.assertEqual(parsed["next_queries"], ["Wix GA4 setup", "Wix Tag Manager"])
+
+    def test_traceable_checker_schema_cites_visible_chunk_ids(self) -> None:
+        messages = build_traceable_evidence_checker_messages(
+            "How do I connect GA4?",
+            [
+                {
+                    "rank": 1,
+                    "chunk_id": "chunk_a",
+                    "snippet_id": "chunk_a:tokens:0-10",
+                    "title": "Google Analytics",
+                    "text_preview": "Connect analytics to a Wix site.",
+                }
+            ],
+        )
+        prompt = "\n".join(message["content"] for message in messages)
+
+        self.assertIn("Chunk ID: chunk_a", prompt)
+        self.assertIn("supporting_chunk_ids", prompt)
+        self.assertIn("derived_from_chunk_ids", prompt)
+        self.assertNotIn("gold_article_ids", prompt)
+
+        parsed = parse_traceable_checker_response(
+            """
+            {
+              "sufficient": false,
+              "seen_chunk_ids": ["chunk_a"],
+              "known_facts": ["GA4 is mentioned"],
+              "covered_facets": [
+                {
+                  "facet_id": "facet_1",
+                  "description": "analytics connection",
+                  "supporting_chunk_ids": ["chunk_a"]
+                }
+              ],
+              "missing_facets": [
+                {
+                  "facet_id": "facet_2",
+                  "description": "property setup",
+                  "inferred_from_chunk_ids": ["chunk_a"],
+                  "blocking": true
+                }
+              ],
+              "next_queries": [
+                {
+                  "query_text": "Wix GA4 property setup",
+                  "target_missing_facet_id": "facet_2",
+                  "derived_from_chunk_ids": ["chunk_a"]
+                },
+                {
+                  "query_text": "Wix GA4 measurement ID",
+                  "target_missing_facet_id": "facet_2",
+                  "derived_from_chunk_ids": ["missing_chunk"]
+                },
+                {
+                  "query_text": "ignored third query",
+                  "target_missing_facet_id": "facet_2",
+                  "derived_from_chunk_ids": ["chunk_a"]
+                }
+              ],
+              "reason": "Need setup details"
+            }
+            """,
+            allowed_chunk_ids=["chunk_a"],
+            max_next_queries=2,
+        )
+
+        self.assertFalse(parsed["sufficient"])
+        self.assertEqual(len(parsed["next_queries"]), 2)
+        self.assertFalse(parsed["provenance_valid"])
+        self.assertEqual(parsed["invalid_provenance_chunk_ids"], ["missing_chunk"])
 
     def test_parse_legacy_missing_evidence_as_blocking_for_compatibility(self) -> None:
         parsed = parse_checker_response(
