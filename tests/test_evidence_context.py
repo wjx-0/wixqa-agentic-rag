@@ -255,6 +255,11 @@ class EvidenceContextTest(unittest.TestCase):
         self.assertTrue(result.completed)
         self.assertEqual(len(result.checker_outputs), 2)
         self.assertEqual(len(result.prompt_manifests), 2)
+        self.assertEqual(result.retrieval_rounds, 1)
+        self.assertEqual(result.second_hop_query_count, 2)
+        self.assertTrue(result.checker_outputs[0]["retrieval_executed"])
+        self.assertEqual(result.checker_outputs[0]["retrieval_query_count"], 2)
+        self.assertFalse(result.checker_outputs[1]["retrieval_executed"])
         self.assertTrue(all(len(row.input_chunk_ids) <= 10 for row in result.prompt_manifests))
         self.assertEqual(len(result.context.candidate_items), 50)
         self.assertEqual([call[1] for call in retriever.calls], [20, 20])
@@ -262,6 +267,52 @@ class EvidenceContextTest(unittest.TestCase):
         self.assertEqual(len(result.prompt_manifests[1].input_chunk_ids), 10)
         self.assertIn("chunk_11", result.prompt_manifests[1].input_chunk_ids)
         self.assertEqual(len(result.usage_snapshots), 2)
+
+    def test_completion_loop_does_not_count_unexecuted_final_round_queries(self) -> None:
+        chunks = [
+            chunk(f"chunk_{index}", f"article_{index}", index)
+            for index in range(1, 11)
+        ]
+        chunk_lookup = {row.chunk_id: row for row in chunks}
+        initial_candidates = [
+            candidate(row.chunk_id, row.article_id, rank)
+            for rank, row in enumerate(chunks, start=1)
+        ]
+        context = build_initial_evidence_context(
+            candidate_row={
+                "qid": "qid",
+                "dataset_name": "wixqa_expertwritten",
+                "question": "question",
+                "answer": "answer",
+                "gold_article_ids": ["missing_article"],
+                "num_gold_articles": 1,
+                "is_multi_article": False,
+                "hybrid_candidates": initial_candidates,
+            },
+            rerank_trace={
+                "qid": "qid",
+                "top10_reranked_chunks": initial_candidates,
+                "case_type": "C_top10_chunks_not_full",
+            },
+            chunk_lookup=chunk_lookup,
+        )
+        retriever = FakeLoopRetriever({"query one": []})
+
+        result = run_evidence_completion_loop(
+            context=context,
+            checker=FakeLoopChecker(),
+            retriever=retriever,
+            reranker=FakeLoopReranker(),
+            chunk_lookup=chunk_lookup,
+            config=EvidenceLoopConfig(max_rounds=0),
+        )
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.retrieval_rounds, 0)
+        self.assertEqual(result.second_hop_query_count, 0)
+        self.assertEqual(retriever.calls, [])
+        self.assertFalse(result.checker_outputs[0]["retrieval_executed"])
+        self.assertEqual(result.checker_outputs[0]["retrieval_query_count"], 0)
 
     def test_loop_eval_writes_outputs_with_fake_components(self) -> None:
         chunks = [
@@ -364,6 +415,10 @@ class EvidenceContextTest(unittest.TestCase):
             self.assertEqual(summary["records"], 1)
             self.assertEqual(summary["final_chunk_full_article_hit@10"], 1.0)
             self.assertEqual(summary["delta_chunk_full_article_hit@10"], 1.0)
+            self.assertEqual(summary["sample_source_rerank_chunk_full_article_hit@10"], 0.0)
+            self.assertEqual(summary["sample_delta_chunk_full_article_hit@10"], 1.0)
+            self.assertEqual(summary["avg_retrieval_rounds"], 1.0)
+            self.assertEqual(summary["avg_second_hop_queries"], 2.0)
             self.assertTrue((run_dir / "metrics.json").exists())
             self.assertTrue((run_dir / "evidence_loop_traces.jsonl").exists())
             self.assertTrue((run_dir / "prompt_manifests.jsonl").exists())

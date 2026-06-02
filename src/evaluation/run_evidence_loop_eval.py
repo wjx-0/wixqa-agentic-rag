@@ -562,8 +562,8 @@ def build_loop_trace(
         "rounds_completed": loop_result.rounds_completed,
         "completed": loop_result.completed,
         "checker_call_count": len(checker_outputs),
-        "retrieval_rounds": sum(bool(output.get("retrieval_triggered")) for output in checker_outputs),
-        "second_hop_query_count": len(context.query_history),
+        "retrieval_rounds": loop_result.retrieval_rounds,
+        "second_hop_query_count": loop_result.second_hop_query_count,
         "prompt_manifests": prompt_manifest_rows,
         "context_usage_snapshots": usage_snapshot_rows,
         "compact_boundaries": compact_boundary_rows,
@@ -624,13 +624,19 @@ def summarize_loop_traces(
     )
     baseline_full = float(rerank_metrics.get("chunk_full_article_hit@10", 0.0))
     final_full = float(summary.get("chunk_full_article_hit@10", 0.0))
+    sample_baseline_full = average(
+        is_full_article_hit(row["gold_article_ids"], row["baseline_top10_article_ids"])
+        for row in traces
+    )
     summary.update(
         {
             "retriever_type": "Traceable EvidenceContext Loop",
             "retrieval_unit": "chunk",
             "source_rerank_chunk_full_article_hit@10": baseline_full,
+            "sample_source_rerank_chunk_full_article_hit@10": sample_baseline_full,
             "final_chunk_full_article_hit@10": final_full,
             "delta_chunk_full_article_hit@10": final_full - baseline_full,
+            "sample_delta_chunk_full_article_hit@10": final_full - sample_baseline_full,
             "completed_count": sum(row["completed"] for row in traces),
             "provenance_invalid_count": sum(not row["provenance_valid"] for row in traces),
             "avg_checker_calls": average(row["checker_call_count"] for row in traces),
@@ -653,6 +659,11 @@ def summarize_loop_traces(
         }
     )
     return summary
+
+
+def is_full_article_hit(gold_article_ids: list[str], retrieved_article_ids: list[str]) -> bool:
+    gold = set(gold_article_ids)
+    return bool(gold) and gold.issubset(set(retrieved_article_ids))
 
 
 def write_outputs(
@@ -695,9 +706,11 @@ def render_metrics_markdown(summary: dict[str, Any]) -> str:
             [
                 ["records", summary["records"]],
                 ["valid_records", summary["valid_records"]],
-                ["source_rerank_full@10", f"{summary['source_rerank_chunk_full_article_hit@10']:.4f}"],
+                ["source_rerank_full@10_global", f"{summary['source_rerank_chunk_full_article_hit@10']:.4f}"],
+                ["source_rerank_full@10_sample", f"{summary['sample_source_rerank_chunk_full_article_hit@10']:.4f}"],
                 ["final_full@10", f"{summary['final_chunk_full_article_hit@10']:.4f}"],
-                ["delta_full@10", f"{summary['delta_chunk_full_article_hit@10']:.4f}"],
+                ["delta_full@10_vs_global", f"{summary['delta_chunk_full_article_hit@10']:.4f}"],
+                ["delta_full@10_sample", f"{summary['sample_delta_chunk_full_article_hit@10']:.4f}"],
                 ["completed_count", summary["completed_count"]],
                 ["provenance_invalid_count", summary["provenance_invalid_count"]],
                 ["avg_checker_calls", f"{summary['avg_checker_calls']:.2f}"],
@@ -733,9 +746,9 @@ def print_summary(console: Console, summary: dict[str, Any], run_dir: Path) -> N
     console.print(
         "[bold green]EvidenceContext 8B loop complete[/bold green] "
         f"records={summary['records']} "
-        f"source_full@10={summary['source_rerank_chunk_full_article_hit@10']:.4f} "
+        f"source_full@10_sample={summary['sample_source_rerank_chunk_full_article_hit@10']:.4f} "
         f"final_full@10={summary['final_chunk_full_article_hit@10']:.4f} "
-        f"delta={summary['delta_chunk_full_article_hit@10']:.4f} "
+        f"sample_delta={summary['sample_delta_chunk_full_article_hit@10']:.4f} "
         f"run_dir={run_dir}"
     )
 

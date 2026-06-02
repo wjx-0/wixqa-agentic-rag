@@ -33,6 +33,8 @@ class EvidenceCompletionLoopResult(BaseModel):
     compact_boundaries: list[CompactBoundary] = Field(default_factory=list)
     completed: bool = False
     rounds_completed: int = 0
+    retrieval_rounds: int = 0
+    second_hop_query_count: int = 0
 
 
 class EvidenceLoopError(RuntimeError):
@@ -57,6 +59,8 @@ def run_evidence_completion_loop(
     compact_boundaries: list[CompactBoundary] = []
     checker_outputs = []
     completed = False
+    retrieval_rounds = 0
+    second_hop_query_count = 0
 
     for round_index in range(config.max_rounds + 1):
         manifest = ensure_round_manifest(
@@ -101,6 +105,8 @@ def run_evidence_completion_loop(
             manifest=manifest,
             round_index=round_index,
         )
+        checker_output["retrieval_executed"] = False
+        checker_output["retrieval_query_count"] = 0
         checker_outputs.append(checker_output)
         update_context_from_checker_output(context, checker_output)
         if checker_output.get("sufficient"):
@@ -123,6 +129,10 @@ def run_evidence_completion_loop(
             chunk_lookup=chunk_lookup,
             config=config,
         )
+        retrieval_rounds += 1
+        second_hop_query_count += len(query_objects)
+        checker_output["retrieval_executed"] = True
+        checker_output["retrieval_query_count"] = len(query_objects)
         selected_new_rows = rerank_new_candidates(
             question=context.question,
             candidate_rows=new_candidate_rows,
@@ -164,6 +174,8 @@ def run_evidence_completion_loop(
         compact_boundaries=compact_boundaries,
         completed=completed,
         rounds_completed=context.round_index,
+        retrieval_rounds=retrieval_rounds,
+        second_hop_query_count=second_hop_query_count,
     )
 
 
