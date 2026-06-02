@@ -115,6 +115,7 @@ def build_evidence_checker_messages(
             "Do not downgrade a missing required facet to nice_to_have_missing_evidence just because related evidence is present.",
             "Do not trigger retrieval for nice-to-have details, extra examples, background context, or minor clarification.",
             "blocking_missing_evidence must list only blocking gaps that justify another retrieval step.",
+            "For how-to, setup, automation, and timeline questions, treat missing steps, phases, conditions, or lifecycle stages as blocking, not nice-to-have, even if partial information is present.",
             "nice_to_have_missing_evidence may list non-blocking details, but those must not cause retrieval.",
             "next_queries must target blocking_missing_evidence, not merely rewrite the original question.",
             "Do not use vague pronouns such as it, this, that feature, or that setting in next_queries.",
