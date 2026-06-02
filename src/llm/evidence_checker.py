@@ -118,10 +118,9 @@ def build_evidence_checker_messages(
             "nice_to_have_missing_evidence may list non-blocking details, but those must not cause retrieval.",
             "next_queries must target blocking_missing_evidence, not merely rewrite the original question.",
             "Do not use vague pronouns such as it, this, that feature, or that setting in next_queries.",
-            "For each blocking gap, generate exactly two queries: one precise and one broad.",
-            "Precise query: include the specific Wix product and feature name (e.g. 'Wix Bookings service category').",
-            "Broad query: remove the specific product name and describe only the action or concept (e.g. 'manage categories in Wix'), because on Wix the same feature may be documented under a different product module such as Stores, Editor, or App.",
-            "Generate at most 3 blocking gaps, producing at most 6 next_queries total (one precise + one broad per gap).",
+            "Generate at most 3 next_queries total.",
+            "At least one query must be a broad variant: remove the specific Wix product name and describe only the action or concept, because the answer may be documented under a different product module such as Stores, Editor, or App.",
+            "Remaining queries should be precise: include the specific Wix product and feature name.",
             "Return valid JSON only with keys: sufficient, known_facts, blocking_missing_evidence, nice_to_have_missing_evidence, next_queries, reason.",
         ]
     )
