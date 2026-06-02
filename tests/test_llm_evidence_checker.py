@@ -146,6 +146,11 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
         self.assertIn("Chunk ID: chunk_a", prompt)
         self.assertIn("supporting_chunk_ids", prompt)
         self.assertIn("derived_from_chunk_ids", prompt)
+        self.assertIn("directly supports the core answer", prompt)
+        self.assertIn("When in doubt, prefer sufficient=true", prompt)
+        self.assertIn("nice-to-have details", prompt)
+        self.assertIn("missing_facets must list only blocking gaps", prompt)
+        self.assertIn("every explicitly required facet", prompt)
         self.assertNotIn("gold_article_ids", prompt)
 
         parsed = parse_traceable_checker_response(
