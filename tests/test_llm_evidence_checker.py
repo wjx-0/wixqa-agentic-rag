@@ -15,6 +15,7 @@ from src.evaluation.run_llm_evidence_checker_eval import (
 )
 from src.llm.evidence_checker import (
     OpenAICompatibleChatClient,
+    TraceableEvidenceChecker,
     build_evidence_checker_messages,
     build_traceable_evidence_checker_messages,
     parse_checker_response,
@@ -151,6 +152,9 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
         self.assertIn("nice-to-have details", prompt)
         self.assertIn("missing_facets must list only blocking gaps", prompt)
         self.assertIn("every explicitly required facet", prompt)
+        self.assertIn("Do not output chain-of-thought", prompt)
+        self.assertIn("Do not use <think> tags", prompt)
+        self.assertIn("first character must be {", prompt)
         self.assertNotIn("gold_article_ids", prompt)
 
         parsed = parse_traceable_checker_response(
@@ -202,6 +206,44 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
         self.assertEqual(len(parsed["next_queries"]), 2)
         self.assertFalse(parsed["provenance_valid"])
         self.assertEqual(parsed["invalid_provenance_chunk_ids"], ["missing_chunk"])
+
+    def test_traceable_checker_preserves_raw_text_on_parse_error(self) -> None:
+        client = FakeLLMClient(['{"sufficient": false'])
+        checker = TraceableEvidenceChecker(client=client)
+        item = type(
+            "Item",
+            (),
+            {
+                "chunk_id": "chunk_a",
+                "snippet_id": "chunk_a:tokens:0-10",
+                "rank": 1,
+                "title": "Title",
+                "text_preview": "Visible text.",
+            },
+        )()
+        context = type(
+            "Context",
+            (),
+            {
+                "question": "question",
+                "compressed_summary": None,
+                "known_facts": [],
+                "covered_facets": [],
+                "missing_facets": [],
+                "query_history": [],
+            },
+        )()
+        manifest = type("Manifest", (), {"llm_call_id": "call"})()
+
+        result = checker.check(
+            context=context,
+            visible_items=[item],
+            manifest=manifest,
+            round_index=0,
+        )
+
+        self.assertFalse(result["checker_valid"])
+        self.assertEqual(result["checker_raw_text"], '{"sufficient": false')
 
     def test_parse_legacy_missing_evidence_as_blocking_for_compatibility(self) -> None:
         parsed = parse_checker_response(

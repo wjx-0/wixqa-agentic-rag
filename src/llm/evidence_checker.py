@@ -195,6 +195,9 @@ def build_traceable_evidence_checker_messages(
     system_prompt = "\n".join(
         [
             "You are an evidence sufficiency checker for Wix Help Center retrieval.",
+            "Do not output chain-of-thought.",
+            "Do not use <think> tags.",
+            "Output only one JSON object; the first character must be { and the last character must be }.",
             "Do not answer the user's question.",
             "Judge whether the visible chunks support a correct, useful, and non-misleading answer.",
             "Set sufficient=true when the visible evidence directly supports the core answer, even if it is not exhaustive.",
@@ -299,6 +302,7 @@ class TraceableEvidenceChecker:
         round_index: int,
     ) -> dict[str, Any]:
         allowed_chunk_ids = [item.chunk_id for item in visible_items]
+        raw_text = ""
         try:
             messages = build_traceable_evidence_checker_messages(
                 context.question,
@@ -324,7 +328,6 @@ class TraceableEvidenceChecker:
             checker_valid = True
             checker_error = None
         except EvidenceCheckerError as exc:
-            raw_text = ""
             result = empty_traceable_checker_result()
             checker_valid = False
             checker_error = str(exc)
