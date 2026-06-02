@@ -114,6 +114,8 @@ def build_evidence_checker_messages(
             "Before deciding sufficient, decompose the question into required facets: Wix product, object/entity, feature, action, setting, integration, error, condition, comparison, or required step.",
             "If the question asks about multiple objects, actions, steps, conditions, products, integrations, or feature requirements, the top10 evidence must directly cover every required facet.",
             "If any required facet is missing, contradicted, or only inferable from adjacent evidence, set sufficient=false and put that exact facet in blocking_missing_evidence.",
+            "Do NOT treat user-side unknowns as blocking gaps: the user's region, account type, product type, plan, or current configuration are context the user already knows and does not need retrieved.",
+            "Do NOT treat third-party or dynamic information as blocking gaps: specific values from Google, PayPal, or other external services, and exact pricing figures that change over time, cannot be retrieved from Wix Help Center and must not trigger retrieval.",
             "Do not downgrade a missing required facet to nice_to_have_missing_evidence just because related evidence is present.",
             "Do not trigger retrieval for nice-to-have details, extra examples, background context, or minor clarification.",
             "blocking_missing_evidence must list only blocking gaps that justify another retrieval step.",
