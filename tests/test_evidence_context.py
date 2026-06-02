@@ -260,11 +260,17 @@ class EvidenceContextTest(unittest.TestCase):
         self.assertTrue(result.checker_outputs[0]["retrieval_executed"])
         self.assertEqual(result.checker_outputs[0]["retrieval_query_count"], 2)
         self.assertFalse(result.checker_outputs[1]["retrieval_executed"])
-        self.assertTrue(all(len(row.input_chunk_ids) <= 10 for row in result.prompt_manifests))
+        self.assertTrue(
+            all(
+                len(row.input_chunk_ids) <= EvidenceLoopConfig().max_raw_chunks_per_checker_call
+                for row in result.prompt_manifests
+            )
+        )
         self.assertEqual(len(result.context.candidate_items), 50)
         self.assertEqual([call[1] for call in retriever.calls], [20, 20])
         self.assertEqual(reranker.candidate_count, 40)
-        self.assertEqual(len(result.prompt_manifests[1].input_chunk_ids), 10)
+        self.assertEqual(len(result.prompt_manifests[0].input_chunk_ids), 10)
+        self.assertEqual(len(result.prompt_manifests[1].input_chunk_ids), 15)
         self.assertIn("chunk_11", result.prompt_manifests[1].input_chunk_ids)
         self.assertEqual(len(result.usage_snapshots), 2)
 
@@ -409,14 +415,17 @@ class EvidenceContextTest(unittest.TestCase):
                 / "outputs"
                 / "hybrid_run"
                 / "rerank_run"
-                / "loop_custom_checker_h20_qwen-qwen3-reranker-0p6b_ctx16k"
+                / "loop_custom_checker_h20_qwen-qwen3-reranker-0p6b_w30_ctx16k"
             )
 
             self.assertEqual(summary["records"], 1)
-            self.assertEqual(summary["final_chunk_full_article_hit@10"], 1.0)
-            self.assertEqual(summary["delta_chunk_full_article_hit@10"], 1.0)
+            self.assertEqual(summary["final_chunk_full_article_hit@10"], 0.0)
+            self.assertEqual(summary["final_context_chunk_full_article_hit"], 1.0)
+            self.assertEqual(summary["delta_chunk_full_article_hit@10"], 0.0)
+            self.assertEqual(summary["delta_context_chunk_full_article_hit"], 1.0)
             self.assertEqual(summary["sample_source_rerank_chunk_full_article_hit@10"], 0.0)
-            self.assertEqual(summary["sample_delta_chunk_full_article_hit@10"], 1.0)
+            self.assertEqual(summary["sample_delta_chunk_full_article_hit@10"], 0.0)
+            self.assertEqual(summary["sample_delta_context_chunk_full_article_hit"], 1.0)
             self.assertEqual(summary["avg_retrieval_rounds"], 1.0)
             self.assertEqual(summary["avg_second_hop_queries"], 2.0)
             self.assertTrue((run_dir / "metrics.json").exists())

@@ -19,7 +19,7 @@ class EvidenceLoopConfig(BaseModel):
     max_rounds: int = 4
     max_queries_per_round: int = 2
     per_query_retrieve_top_k_chunks: int = 20
-    max_raw_chunks_per_checker_call: int = 10
+    max_raw_chunks_per_checker_call: int = 30
     max_new_raw_chunks_per_round: int = 5
     rerank_batch_size: int = 32
     budget: ContextBudgetConfig = Field(default_factory=ContextBudgetConfig)
@@ -53,7 +53,7 @@ def run_evidence_completion_loop(
     config = config or EvidenceLoopConfig()
     validate_loop_config(config)
 
-    visible_items = list(context.active_items[: config.max_raw_chunks_per_checker_call])
+    visible_items = list(context.active_items)
     prompt_manifests = list(context.prompt_manifests)
     usage_snapshots: list[ContextUsageSnapshot] = []
     compact_boundaries: list[CompactBoundary] = []
@@ -75,14 +75,24 @@ def run_evidence_completion_loop(
             visible_items=visible_items,
             config=config,
         )
-        if should_compact(snapshot):
+        if should_compact_window(snapshot, visible_items, config):
+            source_visible_items = list(visible_items)
+            visible_items = compact_visible_window(
+                context=context,
+                visible_items=visible_items,
+                manifest=manifest,
+                config=config,
+            )
             compact_boundary = compact_context(
                 context=context,
+                source_visible_items=source_visible_items,
                 visible_items=visible_items,
                 phase=manifest.phase,
                 before_snapshot=snapshot,
             )
             compact_boundaries.append(compact_boundary)
+            update_manifest_visible_items(manifest, visible_items)
+            context.active_items = visible_items
             snapshot = build_snapshot_for_manifest(
                 context=context,
                 manifest=manifest,
@@ -151,10 +161,10 @@ def run_evidence_completion_loop(
         visible_items = pack_visible_items(
             previous_visible_items=visible_items,
             selected_new_items=selected_new_items,
-            max_raw_chunks=config.max_raw_chunks_per_checker_call,
             llm_call_id=next_llm_call_id,
         )
         context.active_items = visible_items
+        context.packed_items = visible_items
         context.round_index = round_index + 1
         prompt_manifests.append(
             build_round_prompt_manifest(
@@ -191,7 +201,7 @@ def validate_loop_config(config: EvidenceLoopConfig) -> None:
     if config.max_new_raw_chunks_per_round <= 0:
         raise EvidenceLoopError("max_new_raw_chunks_per_round must be positive.")
     if config.max_new_raw_chunks_per_round > config.max_raw_chunks_per_checker_call:
-        raise EvidenceLoopError("max_new_raw_chunks_per_round cannot exceed raw chunk budget.")
+        raise EvidenceLoopError("max_new_raw_chunks_per_round cannot exceed raw chunk window.")
 
 
 def ensure_round_manifest(
@@ -262,28 +272,89 @@ def build_snapshot_for_manifest(
     )
 
 
-def should_compact(snapshot: ContextUsageSnapshot) -> bool:
-    return snapshot.usage_ratio >= SOFT_AUTO_COMPACT_RATIO
+def should_compact_window(
+    snapshot: ContextUsageSnapshot,
+    visible_items: list[EvidenceItem],
+    config: EvidenceLoopConfig,
+) -> bool:
+    return (
+        len(visible_items) > config.max_raw_chunks_per_checker_call
+        or snapshot.usage_ratio >= SOFT_AUTO_COMPACT_RATIO
+    )
+
+
+def compact_visible_window(
+    *,
+    context: EvidenceContext,
+    visible_items: list[EvidenceItem],
+    manifest: PromptManifest,
+    config: EvidenceLoopConfig,
+) -> list[EvidenceItem]:
+    kept_items = trim_visible_window_to_max(
+        visible_items,
+        max_raw_chunks=config.max_raw_chunks_per_checker_call,
+    )
+    while len(kept_items) > 1:
+        snapshot = build_snapshot_for_manifest(
+            context=context,
+            manifest=manifest,
+            visible_items=kept_items,
+            config=config,
+        )
+        if snapshot.usage_ratio <= config.budget.target_after_compact_ratio:
+            break
+        next_items = drop_one_visible_item(kept_items)
+        if len(next_items) == len(kept_items):
+            break
+        kept_items = next_items
+    for item in kept_items:
+        if manifest.llm_call_id not in item.visible_to_llm_call_ids:
+            item.visible_to_llm_call_ids.append(manifest.llm_call_id)
+    return kept_items
+
+
+def trim_visible_window_to_max(
+    visible_items: list[EvidenceItem],
+    *,
+    max_raw_chunks: int,
+) -> list[EvidenceItem]:
+    items = dedupe_items(visible_items)
+    if len(items) <= max_raw_chunks:
+        return items
+    if max_raw_chunks <= 10:
+        return items[-max_raw_chunks:]
+    anchored = items[:10]
+    newest = items[-(max_raw_chunks - len(anchored)) :]
+    return dedupe_items([*anchored, *newest])
+
+
+def drop_one_visible_item(visible_items: list[EvidenceItem]) -> list[EvidenceItem]:
+    if len(visible_items) <= 1:
+        return visible_items
+    start_index = 10 if len(visible_items) > 10 else 0
+    return [item for index, item in enumerate(visible_items) if index != start_index]
+
+
+def update_manifest_visible_items(manifest: PromptManifest, visible_items: list[EvidenceItem]) -> None:
+    manifest.input_chunk_ids = [item.chunk_id for item in visible_items]
+    manifest.input_snippet_ids = [item.snippet_id for item in visible_items]
 
 
 def compact_context(
     *,
     context: EvidenceContext,
+    source_visible_items: list[EvidenceItem],
     visible_items: list[EvidenceItem],
     phase: str,
     before_snapshot: ContextUsageSnapshot,
 ) -> CompactBoundary:
     compact_id = f"{context.qid}:compact:{len(context.compressed_context_ids) + 1}"
     kept_raw_chunk_ids = [item.chunk_id for item in visible_items]
-    source_chunk_ids = sorted(
-        {
-            chunk_id
-            for manifest in context.prompt_manifests
-            for chunk_id in manifest.input_chunk_ids
-        }
-    )
-    dropped_chunk_ids = [chunk_id for chunk_id in source_chunk_ids if chunk_id not in kept_raw_chunk_ids]
-    summary = build_deterministic_context_summary(context)
+    source_chunk_ids = [item.chunk_id for item in source_visible_items]
+    kept_raw_chunk_id_set = set(kept_raw_chunk_ids)
+    dropped_items = [item for item in source_visible_items if item.chunk_id not in kept_raw_chunk_id_set]
+    dropped_chunk_ids = [item.chunk_id for item in dropped_items]
+    summary = build_deterministic_context_summary(context, dropped_items=dropped_items)
     if summary:
         context.compressed_summary = summary
         context.compressed_context_ids.append(compact_id)
@@ -304,10 +375,23 @@ def compact_context(
     )
 
 
-def build_deterministic_context_summary(context: EvidenceContext) -> str:
+def build_deterministic_context_summary(
+    context: EvidenceContext,
+    *,
+    dropped_items: list[EvidenceItem] | None = None,
+) -> str:
     lines = []
     if context.compressed_summary:
         lines.append(context.compressed_summary)
+    if dropped_items:
+        dropped_lines = []
+        for item in dropped_items[:20]:
+            title = item.title or "(untitled)"
+            dropped_lines.append(
+                f"{item.chunk_id} | {title}: {item.text_preview[:240]}"
+            )
+        if dropped_lines:
+            lines.append("Compressed raw evidence: " + " ; ".join(dropped_lines))
     if context.known_facts:
         lines.append("Known facts: " + "; ".join(serialize_state_items(context.known_facts)[:20]))
     if context.covered_facets:
@@ -546,13 +630,9 @@ def pack_visible_items(
     *,
     previous_visible_items: list[EvidenceItem],
     selected_new_items: list[EvidenceItem],
-    max_raw_chunks: int,
     llm_call_id: str,
 ) -> list[EvidenceItem]:
-    new_items = dedupe_items(selected_new_items)[:max_raw_chunks]
-    keep_count = max_raw_chunks - len(new_items)
-    kept_previous = dedupe_items(previous_visible_items)[:keep_count]
-    visible_items = kept_previous + new_items
+    visible_items = dedupe_items([*previous_visible_items, *selected_new_items])
     for item in visible_items:
         if llm_call_id not in item.visible_to_llm_call_ids:
             item.visible_to_llm_call_ids.append(llm_call_id)

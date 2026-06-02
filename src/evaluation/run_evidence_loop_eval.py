@@ -10,11 +10,7 @@ from rich.console import Console
 from tqdm import tqdm
 
 from src.agentic.context_budget import ContextBudgetConfig
-from src.agentic.evidence_context import (
-    DEFAULT_ACTIVE_TOP_K_CHUNKS,
-    EvidenceContextError,
-    build_initial_evidence_context,
-)
+from src.agentic.evidence_context import EvidenceContextError, build_initial_evidence_context
 from src.agentic.evidence_loop import (
     EvidenceCompletionLoopResult,
     EvidenceLoopConfig,
@@ -74,6 +70,7 @@ DEFAULT_BRANCH_TOP_K_CHUNKS = 100
 DEFAULT_SECOND_HOP_TOP_K_CHUNKS = 20
 DEFAULT_RRF_K = 60
 DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS = 16384
+DEFAULT_MAX_RAW_CHUNKS_PER_CHECKER_CALL = 30
 
 
 class EvidenceLoopEvalError(RuntimeError):
@@ -111,7 +108,7 @@ def run_evidence_loop_eval(
     model_context_window_tokens: int = DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
     max_rounds: int = 4,
     max_queries_per_round: int = DEFAULT_TRACEABLE_MAX_NEXT_QUERIES,
-    max_raw_chunks_per_checker_call: int = DEFAULT_ACTIVE_TOP_K_CHUNKS,
+    max_raw_chunks_per_checker_call: int = DEFAULT_MAX_RAW_CHUNKS_PER_CHECKER_CALL,
     max_new_raw_chunks_per_round: int = 5,
     limit: int | None = None,
     qids: list[str] | None = None,
@@ -259,6 +256,7 @@ def run_evidence_loop_eval(
                     candidate_row=candidate_row,
                     rerank_trace=rerank_traces[qid],
                     loop_result=loop_result,
+                    active_top_k_chunks=max_raw_chunks_per_checker_call,
                 )
                 traces.append(trace)
                 prompt_manifests.extend(model_to_dict(row) for row in loop_result.prompt_manifests)
@@ -282,6 +280,7 @@ def run_evidence_loop_eval(
             reranker_model_name=reranker_model_name,
             second_hop_top_k_chunks=second_hop_top_k_chunks,
             model_context_window_tokens=model_context_window_tokens,
+            max_raw_chunks_per_checker_call=max_raw_chunks_per_checker_call,
         )
     )
     write_outputs(
@@ -381,10 +380,8 @@ def validate_args(
         raise EvidenceLoopEvalError("second_hop_top_k_chunks cannot exceed branch_top_k_chunks.")
     if max_queries_per_round > DEFAULT_TRACEABLE_MAX_NEXT_QUERIES:
         raise EvidenceLoopEvalError("Route B defaults to at most 2 next queries per round.")
-    if max_raw_chunks_per_checker_call > 10:
-        raise EvidenceLoopEvalError("Each checker call can inspect at most 10 raw chunks.")
     if max_new_raw_chunks_per_round > max_raw_chunks_per_checker_call:
-        raise EvidenceLoopEvalError("max_new_raw_chunks_per_round cannot exceed raw chunk budget.")
+        raise EvidenceLoopEvalError("max_new_raw_chunks_per_round cannot exceed raw chunk window.")
     for name, value in (
         ("bm25_weight", bm25_weight),
         ("dense_weight", dense_weight),
@@ -515,6 +512,7 @@ def build_loop_trace(
     candidate_row: dict[str, Any],
     rerank_trace: dict[str, Any],
     loop_result: EvidenceCompletionLoopResult,
+    active_top_k_chunks: int,
 ) -> dict[str, Any]:
     context = loop_result.context
     example = candidate_row_to_example(candidate_row)
@@ -527,9 +525,9 @@ def build_loop_trace(
             "score": item.rerank_score if item.rerank_score is not None else item.score,
             "text_preview": item.text_preview,
         }
-        for rank, item in enumerate(context.active_items[:10], start=1)
+        for rank, item in enumerate(context.active_items[:active_top_k_chunks], start=1)
     ]
-    ks = select_chunk_ks(10)
+    ks = select_chunk_ks(active_top_k_chunks)
     metrics = compute_chunk_retrieval_metrics(example.article_ids, final_results, ks)
     final_article_ids = [row["article_id"] for row in final_results]
     source_case_type = rerank_trace.get("case_type")
@@ -557,7 +555,13 @@ def build_loop_trace(
         "baseline_top10_article_ids": [row["article_id"] for row in rerank_trace["top10_reranked_chunks"]],
         "final_active_chunk_ids": [row["chunk_id"] for row in final_results],
         "final_active_article_ids": final_article_ids,
-        "final_case_type": classify_chunk_case(example.article_ids, final_article_ids, 10),
+        "final_context_top_k_chunks": active_top_k_chunks,
+        "baseline_context_full_article_hit": is_full_article_hit(
+            example.article_ids,
+            [row["article_id"] for row in rerank_trace["top10_reranked_chunks"]],
+        ),
+        "final_context_full_article_hit": is_full_article_hit(example.article_ids, final_article_ids),
+        "final_case_type": classify_chunk_case(example.article_ids, final_article_ids, active_top_k_chunks),
         "candidate_items_count": len(context.candidate_items),
         "rounds_completed": loop_result.rounds_completed,
         "completed": loop_result.completed,
@@ -623,7 +627,8 @@ def summarize_loop_traces(
         top_k_chunks=active_top_k_chunks,
     )
     baseline_full = float(rerank_metrics.get("chunk_full_article_hit@10", 0.0))
-    final_full = float(summary.get("chunk_full_article_hit@10", 0.0))
+    final_top10_full = float(summary.get("chunk_full_article_hit@10", 0.0))
+    final_context_full = float(summary.get(f"chunk_full_article_hit@{active_top_k_chunks}", final_top10_full))
     sample_baseline_full = average(
         is_full_article_hit(row["gold_article_ids"], row["baseline_top10_article_ids"])
         for row in traces
@@ -634,9 +639,13 @@ def summarize_loop_traces(
             "retrieval_unit": "chunk",
             "source_rerank_chunk_full_article_hit@10": baseline_full,
             "sample_source_rerank_chunk_full_article_hit@10": sample_baseline_full,
-            "final_chunk_full_article_hit@10": final_full,
-            "delta_chunk_full_article_hit@10": final_full - baseline_full,
-            "sample_delta_chunk_full_article_hit@10": final_full - sample_baseline_full,
+            "final_context_top_k_chunks": active_top_k_chunks,
+            "final_chunk_full_article_hit@10": final_top10_full,
+            "final_context_chunk_full_article_hit": final_context_full,
+            "delta_chunk_full_article_hit@10": final_top10_full - baseline_full,
+            "sample_delta_chunk_full_article_hit@10": final_top10_full - sample_baseline_full,
+            "delta_context_chunk_full_article_hit": final_context_full - baseline_full,
+            "sample_delta_context_chunk_full_article_hit": final_context_full - sample_baseline_full,
             "completed_count": sum(row["completed"] for row in traces),
             "provenance_invalid_count": sum(not row["provenance_valid"] for row in traces),
             "avg_checker_calls": average(row["checker_call_count"] for row in traces),
@@ -653,7 +662,7 @@ def summarize_loop_traces(
             "source_case_C_count": sum(str(row.get("source_case_type", "")).startswith("C_") for row in traces),
             "source_B_or_C_final_full_count": sum(
                 str(row.get("source_case_type", "")).startswith(("B_", "C_"))
-                and row["final_case_type"] == "A_top10_chunks_full"
+                and row["final_context_full_article_hit"]
                 for row in traces
             ),
         }
@@ -685,11 +694,11 @@ def write_outputs(
     write_jsonl(run_dir / "compact_boundaries.jsonl", compact_boundaries)
     write_jsonl(
         run_dir / "cases_final_context_not_full.jsonl",
-        [row for row in traces if row["final_case_type"] != "A_top10_chunks_full"],
+        [row for row in traces if not row["final_context_full_article_hit"]],
     )
     write_jsonl(
         run_dir / "cases_final_context_full.jsonl",
-        [row for row in traces if row["final_case_type"] == "A_top10_chunks_full"],
+        [row for row in traces if row["final_context_full_article_hit"]],
     )
     write_jsonl(
         run_dir / "cases_invalid_provenance.jsonl",
@@ -698,7 +707,7 @@ def write_outputs(
 
 
 def render_metrics_markdown(summary: dict[str, Any]) -> str:
-    top_k_chunks = 10
+    top_k_chunks = int(summary["final_context_top_k_chunks"])
     lines = ["# Traceable EvidenceContext Loop", "", "## 基本信息", ""]
     lines.extend(
         markdown_table(
@@ -709,8 +718,11 @@ def render_metrics_markdown(summary: dict[str, Any]) -> str:
                 ["source_rerank_full@10_global", f"{summary['source_rerank_chunk_full_article_hit@10']:.4f}"],
                 ["source_rerank_full@10_sample", f"{summary['sample_source_rerank_chunk_full_article_hit@10']:.4f}"],
                 ["final_full@10", f"{summary['final_chunk_full_article_hit@10']:.4f}"],
+                [f"final_context_full@{top_k_chunks}", f"{summary['final_context_chunk_full_article_hit']:.4f}"],
                 ["delta_full@10_vs_global", f"{summary['delta_chunk_full_article_hit@10']:.4f}"],
                 ["delta_full@10_sample", f"{summary['sample_delta_chunk_full_article_hit@10']:.4f}"],
+                [f"delta_context@{top_k_chunks}_vs_global", f"{summary['delta_context_chunk_full_article_hit']:.4f}"],
+                [f"delta_context@{top_k_chunks}_sample", f"{summary['sample_delta_context_chunk_full_article_hit']:.4f}"],
                 ["completed_count", summary["completed_count"]],
                 ["provenance_invalid_count", summary["provenance_invalid_count"]],
                 ["avg_checker_calls", f"{summary['avg_checker_calls']:.2f}"],
@@ -747,8 +759,9 @@ def print_summary(console: Console, summary: dict[str, Any], run_dir: Path) -> N
         "[bold green]EvidenceContext 8B loop complete[/bold green] "
         f"records={summary['records']} "
         f"source_full@10_sample={summary['sample_source_rerank_chunk_full_article_hit@10']:.4f} "
-        f"final_full@10={summary['final_chunk_full_article_hit@10']:.4f} "
-        f"sample_delta={summary['sample_delta_chunk_full_article_hit@10']:.4f} "
+        f"final_context_full@{summary['final_context_top_k_chunks']}="
+        f"{summary['final_context_chunk_full_article_hit']:.4f} "
+        f"context_sample_delta={summary['sample_delta_context_chunk_full_article_hit']:.4f} "
         f"run_dir={run_dir}"
     )
 
@@ -759,10 +772,12 @@ def build_run_name(
     reranker_model_name: str,
     second_hop_top_k_chunks: int,
     model_context_window_tokens: int,
+    max_raw_chunks_per_checker_call: int,
 ) -> str:
     return (
         f"loop_{safe_name(llm_model)}_h{second_hop_top_k_chunks}_"
-        f"{safe_name(reranker_model_name)}_ctx{model_context_window_tokens // 1024}k"
+        f"{safe_name(reranker_model_name)}_w{max_raw_chunks_per_checker_call}_"
+        f"ctx{model_context_window_tokens // 1024}k"
     )
 
 

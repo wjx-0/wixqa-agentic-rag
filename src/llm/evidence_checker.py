@@ -189,9 +189,6 @@ def build_traceable_evidence_checker_messages(
         raise EvidenceCheckerError("max_context_chars must be positive.")
     if max_next_queries <= 0:
         raise EvidenceCheckerError("max_next_queries must be positive.")
-    if len(top_chunks) > 10:
-        raise EvidenceCheckerError("traceable checker can inspect at most 10 raw chunks.")
-
     system_prompt = "\n".join(
         [
             "You are an evidence sufficiency checker for Wix Help Center retrieval.",

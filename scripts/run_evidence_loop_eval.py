@@ -15,6 +15,7 @@ from src.evaluation.run_evidence_context_eval import DEFAULT_RERANK_RUN_DIR
 from src.evaluation.run_evidence_loop_eval import (
     DEFAULT_BRANCH_TOP_K_CHUNKS,
     DEFAULT_INDEX_DIR,
+    DEFAULT_MAX_RAW_CHUNKS_PER_CHECKER_CALL,
     DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_RRF_K,
@@ -96,7 +97,11 @@ def main() -> int:
     )
     parser.add_argument("--max_rounds", type=int, default=4)
     parser.add_argument("--max_queries_per_round", type=int, default=DEFAULT_TRACEABLE_MAX_NEXT_QUERIES)
-    parser.add_argument("--max_raw_chunks_per_checker_call", type=int, default=10)
+    parser.add_argument(
+        "--max_raw_chunks_per_checker_call",
+        type=int,
+        default=DEFAULT_MAX_RAW_CHUNKS_PER_CHECKER_CALL,
+    )
     parser.add_argument("--max_new_raw_chunks_per_round", type=int, default=5)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--qids", type=parse_qids, default=None)
@@ -147,4 +152,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
