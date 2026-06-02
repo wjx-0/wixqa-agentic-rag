@@ -48,6 +48,7 @@ from src.rerankers.cross_encoder_reranker import (
 )
 from src.retrievers.rule_second_hop import RuleSecondHopError, merge_chunk_candidates
 from src.utils.io_utils import ensure_dir, read_jsonl, write_json, write_jsonl
+from src.utils.text_utils import compact_text
 
 
 DEFAULT_LLM_CHECKER_RUN_DIR = (
@@ -57,7 +58,14 @@ DEFAULT_LLM_CHECKER_RUN_DIR = (
     "qwen3_8b_s3_h20_pool_eval"
 )
 DEFAULT_OUTPUT_DIR = "outputs/agentic_rag"
-DEFAULT_AGENTIC_RUN_NAME = "rerank_merged_pool"
+DEFAULT_AGENTIC_RUN_NAME = "gap_aware_rerank_merged_pool_a0p6_b0p4"
+GAP_AWARE_ALPHA = 0.6
+GAP_AWARE_BETA = 0.4
+GAP_QUERY_MAPPING = "best_second_hop_rank"
+GAP_AWARE_APPLIES_TO = "pure_second_hop_only"
+GAP_AWARE_EVAL_SCOPE = (
+    "phase8_merged_pool_offline_gap_aware_rerank_no_llm_no_retrieval"
+)
 
 
 class AgenticRerankEvalError(RuntimeError):
@@ -184,10 +192,12 @@ def run_agentic_rerank_eval(
                 )
             if not merged_candidates:
                 raise AgenticRerankEvalError(f"Merged candidate pool is empty for qid={qid}.")
-            final_results = reranker.rerank(
-                candidate_row["question"],
-                merged_candidates,
-                chunk_lookup,
+            final_results = rerank_gap_aware_candidates(
+                question=candidate_row["question"],
+                checker_trace=checker_trace,
+                candidates=merged_candidates,
+                reranker=reranker,
+                chunk_lookup=chunk_lookup,
                 batch_size=rerank_batch_size,
             )
             if len(final_results) != len(merged_candidates):
@@ -247,7 +257,12 @@ def run_agentic_rerank_eval(
             "instruction_name": instruction_name,
             "instruction": instruction,
             "dense_worker_mode": dense_worker_mode,
-            "eval_scope": "phase8_merged_pool_offline_rerank_no_llm_no_retrieval",
+            "eval_scope": GAP_AWARE_EVAL_SCOPE,
+            "rerank_scoring_mode": "gap_aware",
+            "gap_aware_alpha": GAP_AWARE_ALPHA,
+            "gap_aware_beta": GAP_AWARE_BETA,
+            "gap_query_mapping": GAP_QUERY_MAPPING,
+            "gap_aware_applies_to": GAP_AWARE_APPLIES_TO,
             "merged_candidate_upper_bound": merged_candidate_upper_bound,
             "top10_primary_context_budget": 10,
             "top20_diagnostic_context_budget": 20,
@@ -272,6 +287,187 @@ def validate_args(
         raise AgenticRerankEvalError("instruction must not be empty.")
     if not instruction_name.strip():
         raise AgenticRerankEvalError("instruction_name must not be empty.")
+
+
+def rerank_gap_aware_candidates(
+    *,
+    question: str,
+    checker_trace: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    reranker: Any,
+    chunk_lookup: dict[str, Any],
+    batch_size: int,
+) -> list[dict[str, Any]]:
+    original_results = reranker.rerank(
+        question,
+        candidates,
+        chunk_lookup,
+        batch_size=batch_size,
+    )
+    if len(original_results) != len(candidates):
+        raise AgenticRerankEvalError(
+            "Original-query reranker result count does not match candidate count: "
+            f"results={len(original_results)}, candidates={len(candidates)}."
+        )
+
+    original_by_chunk_id = index_rerank_results(original_results, label="original rerank")
+    gap_query_lookup = build_gap_query_lookup(checker_trace)
+    selected_gap_queries: dict[str, tuple[str, str]] = {}
+    gap_candidates_by_query_id: dict[str, list[dict[str, Any]]] = {}
+
+    for candidate in candidates:
+        query_id = select_gap_query_id_for_chunk(candidate)
+        if not query_id:
+            continue
+        query_text = gap_query_lookup.get(query_id)
+        if not query_text:
+            raise AgenticRerankEvalError(
+                "Pure second-hop chunk references an unknown gap query_id: "
+                f"chunk_id={candidate.get('chunk_id')}, query_id={query_id}."
+            )
+        chunk_id = compact_text(candidate.get("chunk_id"))
+        selected_gap_queries[chunk_id] = (query_id, query_text)
+        gap_candidates_by_query_id.setdefault(query_id, []).append(candidate)
+
+    gap_scores_by_chunk_id: dict[str, float] = {}
+    for query_id, query_candidates in gap_candidates_by_query_id.items():
+        query_text = gap_query_lookup[query_id]
+        gap_results = reranker.rerank(
+            query_text,
+            query_candidates,
+            chunk_lookup,
+            batch_size=batch_size,
+        )
+        if len(gap_results) != len(query_candidates):
+            raise AgenticRerankEvalError(
+                "Gap-query reranker result count does not match candidate count: "
+                f"query_id={query_id}, results={len(gap_results)}, "
+                f"candidates={len(query_candidates)}."
+            )
+        for result in gap_results:
+            chunk_id = compact_text(result.get("chunk_id"))
+            gap_scores_by_chunk_id[chunk_id] = float(result["rerank_score"])
+
+    scored_results = []
+    for candidate in candidates:
+        chunk_id = compact_text(candidate.get("chunk_id"))
+        original_result = original_by_chunk_id[chunk_id]
+        score_original = float(original_result["rerank_score"])
+        selected_query = selected_gap_queries.get(chunk_id)
+        if selected_query is None:
+            score_gap = None
+            gap_query_id = None
+            gap_query_text = None
+            gap_aware_score = score_original
+        else:
+            gap_query_id, gap_query_text = selected_query
+            score_gap = gap_scores_by_chunk_id.get(chunk_id)
+            if score_gap is None:
+                raise AgenticRerankEvalError(
+                    "Missing gap-query score for pure second-hop chunk: "
+                    f"chunk_id={chunk_id}, query_id={gap_query_id}."
+                )
+            gap_aware_score = GAP_AWARE_ALPHA * score_original + GAP_AWARE_BETA * score_gap
+
+        scored_results.append(
+            {
+                **original_result,
+                "score_original": score_original,
+                "score_gap": score_gap,
+                "gap_query_id": gap_query_id,
+                "gap_query_text": gap_query_text,
+                "gap_aware_score": gap_aware_score,
+                "gap_aware_alpha": GAP_AWARE_ALPHA,
+                "gap_aware_beta": GAP_AWARE_BETA,
+                "rerank_score": gap_aware_score,
+                "score": gap_aware_score,
+            }
+        )
+
+    ranked = sorted(
+        scored_results,
+        key=lambda result: (
+            -float(result["gap_aware_score"]),
+            int(result.get("merged_rank") or result.get("hybrid_rank") or result.get("rank") or 0),
+            str(result["chunk_id"]),
+        ),
+    )
+    return [{**result, "rank": rank} for rank, result in enumerate(ranked, start=1)]
+
+
+def index_rerank_results(results: list[dict[str, Any]], *, label: str) -> dict[str, dict[str, Any]]:
+    indexed = {}
+    for result in results:
+        chunk_id = compact_text(result.get("chunk_id"))
+        if not chunk_id:
+            raise AgenticRerankEvalError(f"{label} result is missing chunk_id.")
+        if chunk_id in indexed:
+            raise AgenticRerankEvalError(f"Duplicate chunk_id in {label}: {chunk_id}.")
+        indexed[chunk_id] = result
+    return indexed
+
+
+def build_gap_query_lookup(checker_trace: dict[str, Any]) -> dict[str, str]:
+    lookup = {}
+    queries = checker_trace.get("second_hop_queries") or []
+    if not isinstance(queries, list):
+        raise AgenticRerankEvalError("Checker trace second_hop_queries must be a list.")
+    for query in queries:
+        if not isinstance(query, dict):
+            raise AgenticRerankEvalError("Checker trace second_hop_queries must contain objects.")
+        query_id = compact_text(query.get("query_id"))
+        query_text = compact_text(query.get("query_text"))
+        if not query_id or not query_text:
+            raise AgenticRerankEvalError(
+                "Checker trace second_hop_queries entries require query_id and query_text."
+            )
+        if query_id in lookup:
+            raise AgenticRerankEvalError(f"Duplicate second-hop query_id: {query_id}.")
+        lookup[query_id] = query_text
+    return lookup
+
+
+def select_gap_query_id_for_chunk(candidate: dict[str, Any]) -> str | None:
+    if candidate.get("first_hop_rank") is not None:
+        return None
+
+    query_ids = [
+        query_id
+        for query_id in (compact_text(value) for value in candidate.get("second_hop_query_ids") or [])
+        if query_id
+    ]
+    if not query_ids:
+        raise AgenticRerankEvalError(
+            f"Pure second-hop chunk is missing second_hop_query_ids: {candidate.get('chunk_id')}."
+        )
+    if len(query_ids) == 1:
+        return query_ids[0]
+
+    query_order = {query_id: index for index, query_id in enumerate(query_ids)}
+    ranked_query_ids = []
+    for item in candidate.get("second_hop_ranks") or []:
+        if not isinstance(item, dict):
+            raise AgenticRerankEvalError(
+                f"second_hop_ranks entries must be objects: {candidate.get('chunk_id')}."
+            )
+        query_id = compact_text(item.get("query_id"))
+        if query_id not in query_order:
+            continue
+        try:
+            rank = int(item.get("rank"))
+        except (TypeError, ValueError) as exc:
+            raise AgenticRerankEvalError(
+                f"Invalid second-hop rank for chunk_id={candidate.get('chunk_id')}, "
+                f"query_id={query_id}."
+            ) from exc
+        ranked_query_ids.append((rank, query_order[query_id], query_id))
+
+    if not ranked_query_ids:
+        raise AgenticRerankEvalError(
+            f"Pure second-hop chunk has multiple query_ids but no usable second_hop_ranks: "
+            f"{candidate.get('chunk_id')}."
+        )
+    return min(ranked_query_ids)[2]
 
 
 def load_checker_trace_lookup(path: Path) -> dict[str, dict[str, Any]]:
@@ -349,7 +545,7 @@ def build_agentic_rerank_trace(
     ]
     trace.update(
         {
-            "eval_scope": "phase8_merged_pool_offline_rerank_no_llm_no_retrieval",
+            "eval_scope": GAP_AWARE_EVAL_SCOPE,
             "baseline_top10_chunks": baseline_trace["top10_reranked_chunks"],
             "baseline_top10_article_ids": result_article_ids(
                 baseline_trace["top10_reranked_chunks"]
@@ -453,8 +649,8 @@ def summarize_agentic_rerank_traces(
     multi_rows = [row for row in valid_rows if row["is_multi_article"]]
     summary.update(
         {
-            "eval_scope": "phase8_merged_pool_offline_rerank_no_llm_no_retrieval",
-            "retriever_type": "LLM Gap-query Merged Pool + Qwen3 Rerank",
+            "eval_scope": GAP_AWARE_EVAL_SCOPE,
+            "retriever_type": "LLM Gap-query Merged Pool + Qwen3 Gap-aware Rerank",
             "first_hop_candidate_top_k_chunks": DEFAULT_FIRST_HOP_TOP_K_CHUNKS,
             "merged_candidate_upper_bound": merged_candidate_upper_bound,
             "source_baseline_metrics": baseline_metrics,
@@ -593,7 +789,7 @@ def render_metrics_markdown(summary: dict[str, Any]) -> str:
         ["avg_merged_candidates", f"{summary['avg_merged_candidates']:.4f}"],
         ["avg_rerank_candidates", f"{summary['avg_rerank_candidates']:.4f}"],
     ]
-    lines = ["# Phase 9 LLM Gap-query Merged Pool Rerank", ""]
+    lines = ["# Phase 9 LLM Gap-query Merged Pool Gap-aware Rerank", ""]
     lines.extend(markdown_table(["metric", "value"], rows))
     return "\n".join(lines)
 
@@ -653,7 +849,7 @@ def render_comparison_markdown(summary: dict[str, Any]) -> str:
             "N/A",
         ],
         [
-            "Phase 9 LLM gap-query merged-pool + Qwen3 rerank",
+            "Phase 9 LLM gap-query merged-pool + Qwen3 gap-aware rerank",
             "final top10 primary, top20 diagnostic",
             metric_value(summary, "chunk_full_article_hit@10"),
             metric_value(summary, "multi_chunk_full_article_hit@10"),
