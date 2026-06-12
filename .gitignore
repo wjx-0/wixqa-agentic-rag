@@ -10,4 +10,5 @@ indexes/
 venv/
 *.pyc
 .DS_Store
-.env
+.env*
+!.env.example

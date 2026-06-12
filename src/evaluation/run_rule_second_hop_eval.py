@@ -42,6 +42,7 @@ from src.retrievers.rule_second_hop import (
     merge_chunk_candidates,
 )
 from src.utils.io_utils import ensure_dir, read_json, read_jsonl, write_json, write_jsonl
+from src.utils.metrics import average
 
 
 DEFAULT_FIRST_HOP_HYBRID_RUN_DIR = (
@@ -679,11 +680,6 @@ def count_true(
         bool(row.get(key)) and (not multi_only or bool(row.get("is_multi_article")))
         for row in rows
     )
-
-
-def average(values: Any) -> float:
-    items = list(values)
-    return sum(float(value) for value in items) / len(items) if items else 0.0
 
 
 def write_outputs(

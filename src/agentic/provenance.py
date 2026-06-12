@@ -32,6 +32,12 @@ class GapQueryProvenance(BaseModel):
     derived_from_chunk_ids: list[str] = Field(default_factory=list)
     seen_chunk_ids: list[str] = Field(default_factory=list)
     checker_call_id: str | None = None
+    retrieved_chunk_ids: list[str] = Field(default_factory=list)
+    retrieved_article_ids: list[str] = Field(default_factory=list)
+    candidate_chunk_ids: list[str] = Field(default_factory=list)
+    candidate_article_ids: list[str] = Field(default_factory=list)
+    selected_chunk_ids: list[str] = Field(default_factory=list)
+    selected_article_ids: list[str] = Field(default_factory=list)
     schema_version: str = PROVENANCE_SCHEMA_VERSION
 
 
@@ -39,6 +45,7 @@ class AnswerProvenance(BaseModel):
     answer_call_id: str
     seen_chunk_ids: list[str] = Field(default_factory=list)
     supporting_chunk_ids: list[str] = Field(default_factory=list)
+    supporting_compressed_context_ids: list[str] = Field(default_factory=list)
     supporting_facet_ids: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     schema_version: str = PROVENANCE_SCHEMA_VERSION
@@ -53,6 +60,9 @@ class CompactBoundary(BaseModel):
     compressed_context_ids: list[str] = Field(default_factory=list)
     dropped_chunk_ids: list[str] = Field(default_factory=list)
     source_to_summary_map: dict[str, str] = Field(default_factory=dict)
+    compression_used_api: bool = False
+    compression_fallback_used: bool = False
+    compression_error: str | None = None
     before_usage_ratio: float
     after_usage_ratio: float | None = None
     schema_version: str = PROVENANCE_SCHEMA_VERSION

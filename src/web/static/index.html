@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WixQA Agent Console</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="topbar">
+        <div>
+          <h1>WixQA Agent Console</h1>
+          <p id="sessionLabel">conversation</p>
+        </div>
+        <div class="profile-row">
+          <label for="profileSelect">Profile</label>
+          <select id="profileSelect">
+            <option value="fast">fast</option>
+            <option value="full_eval">full_eval</option>
+          </select>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <section class="chat-pane" aria-label="Conversation">
+          <div id="messages" class="messages"></div>
+          <form id="chatForm" class="composer">
+            <textarea
+              id="messageInput"
+              rows="2"
+              placeholder="输入 Wix 客服问题"
+            ></textarea>
+            <button id="sendButton" type="submit">Send</button>
+          </form>
+        </section>
+
+        <section class="process-pane" aria-label="Pipeline">
+          <div class="pane-head">
+            <h2>Pipeline</h2>
+            <span id="statusPill" class="status-pill">idle</span>
+          </div>
+          <div id="eventList" class="event-list"></div>
+        </section>
+
+        <section class="detail-pane" aria-label="Details">
+          <div class="pane-head">
+            <h2>Details</h2>
+            <span id="latencyTotal">0 ms</span>
+          </div>
+          <div id="stageBars" class="stage-bars"></div>
+          <h3>Evidence</h3>
+          <div id="evidenceList" class="evidence-list"></div>
+          <h3>Payload</h3>
+          <pre id="payloadView" class="payload-view">{}</pre>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

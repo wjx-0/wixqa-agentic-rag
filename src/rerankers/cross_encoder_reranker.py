@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 from typing import Any
 
 from src.data.schema import KBChunk
@@ -41,6 +42,7 @@ class CrossEncoderReranker:
         self.model_name = model_name
         self.instruction = instruction
         self.max_length = max_length
+        self._lock = threading.RLock()
         self.model = model or self._load_model(
             model_name=model_name,
             local_files_only=local_files_only,
@@ -87,17 +89,18 @@ class CrossEncoderReranker:
         if not pairs:
             return []
 
-        try:
-            scores = self.model.predict(
-                pairs,
-                prompt_name="query",
-                batch_size=batch_size,
-                show_progress_bar=False,
-            )
-        except Exception as exc:
-            raise CrossEncoderRerankerError(
-                f"Qwen3 reranker scoring failed for {len(pairs)} candidates: {exc}"
-            ) from exc
+        with self._lock:
+            try:
+                scores = self.model.predict(
+                    pairs,
+                    prompt_name="query",
+                    batch_size=batch_size,
+                    show_progress_bar=False,
+                )
+            except Exception as exc:
+                raise CrossEncoderRerankerError(
+                    f"Qwen3 reranker scoring failed for {len(pairs)} candidates: {exc}"
+                ) from exc
 
         if len(scores) != len(enriched_candidates):
             raise CrossEncoderRerankerError(

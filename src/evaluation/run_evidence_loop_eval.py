@@ -39,12 +39,17 @@ from src.evaluation.run_rerank_eval import (
     load_required_json,
 )
 from src.llm.evidence_checker import (
+    CHECKER_MODE_COMPACT,
+    CHECKER_MODE_TRACEABLE,
     DEFAULT_CHECKER_MAX_TOKENS,
     DEFAULT_CHECKER_TEMPERATURE,
     DEFAULT_CHECKER_TIMEOUT,
     DEFAULT_CONTEXT_PREVIEW_CHARS,
     DEFAULT_TRACEABLE_MAX_NEXT_QUERIES,
+    VALID_CHECKER_MODES,
+    CompactEvidenceChecker,
     OpenAICompatibleChatClient,
+    RetryingEvidenceChecker,
     TraceableEvidenceChecker,
 )
 from src.rerankers.cross_encoder_reranker import (
@@ -56,21 +61,37 @@ from src.rerankers.cross_encoder_reranker import (
     CrossEncoderReranker,
     CrossEncoderRerankerError,
 )
+from src.rerankers.dashscope_reranker import (
+    DEFAULT_DASHSCOPE_RERANK_MODEL,
+    DEFAULT_DASHSCOPE_RERANK_TIMEOUT,
+    DEFAULT_DASHSCOPE_RERANK_URL,
+    DashScopeReranker,
+    DashScopeRerankerError,
+)
 from src.retrievers.dense_faiss_retriever import DEFAULT_DENSE_MODEL_NAME
 from src.retrievers.dense_worker_client import VALID_WORKER_MODES
 from src.retrievers.hybrid_retriever import HybridRetriever, HybridRetrieverError
 from src.retrievers.rrf import DEFAULT_BM25_WEIGHT, DEFAULT_DENSE_WEIGHT
+from src.utils.env_utils import (
+    dashscope_rerank_model_from_env,
+    dashscope_rerank_url_from_env,
+    deepseek_base_url_from_env,
+)
 from src.utils.io_utils import ensure_dir, model_to_dict, write_json, write_jsonl
+from src.utils.metrics import average
 from src.utils.text_utils import compact_text
 
 
 DEFAULT_OUTPUT_DIR = "outputs/evidence_loop"
 DEFAULT_INDEX_DIR = "indexes/faiss_bge_m3"
-DEFAULT_BRANCH_TOP_K_CHUNKS = 100
+DEFAULT_BRANCH_TOP_K_CHUNKS = 50
 DEFAULT_SECOND_HOP_TOP_K_CHUNKS = 20
 DEFAULT_RRF_K = 60
 DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS = 16384
 DEFAULT_MAX_RAW_CHUNKS_PER_CHECKER_CALL = 30
+RERANKER_PROVIDER_LOCAL = "local"
+RERANKER_PROVIDER_DASHSCOPE = "dashscope"
+VALID_RERANKER_PROVIDERS = {RERANKER_PROVIDER_LOCAL, RERANKER_PROVIDER_DASHSCOPE}
 
 
 class EvidenceLoopEvalError(RuntimeError):
@@ -92,26 +113,37 @@ def run_evidence_loop_eval(
     rrf_k: int = DEFAULT_RRF_K,
     bm25_weight: float = DEFAULT_BM25_WEIGHT,
     dense_weight: float = DEFAULT_DENSE_WEIGHT,
+    reranker_provider: str = RERANKER_PROVIDER_LOCAL,
     reranker_model_name: str = DEFAULT_RERANK_MODEL_NAME,
     reranker_local_files_only: bool = True,
     reranker_batch_size: int = DEFAULT_RERANK_BATCH_SIZE,
     reranker_max_length: int = DEFAULT_MAX_LENGTH,
     reranker_instruction_name: str = DEFAULT_INSTRUCTION_NAME,
     reranker_instruction: str = DEFAULT_RERANK_INSTRUCTION,
+    dashscope_rerank_url: str | None = None,
+    dashscope_rerank_api_key: str | None = None,
+    dashscope_rerank_model: str | None = None,
+    dashscope_rerank_timeout: float = DEFAULT_DASHSCOPE_RERANK_TIMEOUT,
     llm_base_url: str | None = None,
     llm_api_key: str | None = None,
     llm_model: str | None = None,
     llm_temperature: float = DEFAULT_CHECKER_TEMPERATURE,
     llm_max_tokens: int = DEFAULT_CHECKER_MAX_TOKENS,
     llm_timeout: float = DEFAULT_CHECKER_TIMEOUT,
+    checker_mode: str = CHECKER_MODE_TRACEABLE,
+    checker_retry_attempts: int = 1,
     context_preview_chars: int = DEFAULT_CONTEXT_PREVIEW_CHARS,
     model_context_window_tokens: int = DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
     max_rounds: int = 4,
+    min_retrieval_rounds: int = 0,
     max_queries_per_round: int = DEFAULT_TRACEABLE_MAX_NEXT_QUERIES,
     max_raw_chunks_per_checker_call: int = DEFAULT_MAX_RAW_CHUNKS_PER_CHECKER_CALL,
     max_new_raw_chunks_per_round: int = 5,
+    max_new_chunks_per_article: int = 1,
+    max_visible_chunks_per_article: int = 2,
     limit: int | None = None,
     qids: list[str] | None = None,
+    source_case_prefixes: list[str] | None = None,
     checker: Any | None = None,
     checker_client: Any | None = None,
     retriever: Any | None = None,
@@ -124,18 +156,25 @@ def run_evidence_loop_eval(
         rrf_k=rrf_k,
         bm25_weight=bm25_weight,
         dense_weight=dense_weight,
+        reranker_provider=reranker_provider,
         dense_query_batch_size=dense_query_batch_size,
         reranker_batch_size=reranker_batch_size,
         reranker_max_length=reranker_max_length,
+        dashscope_rerank_timeout=dashscope_rerank_timeout,
         llm_temperature=llm_temperature,
         llm_max_tokens=llm_max_tokens,
         llm_timeout=llm_timeout,
+        checker_mode=checker_mode,
+        checker_retry_attempts=checker_retry_attempts,
         context_preview_chars=context_preview_chars,
         model_context_window_tokens=model_context_window_tokens,
         max_rounds=max_rounds,
+        min_retrieval_rounds=min_retrieval_rounds,
         max_queries_per_round=max_queries_per_round,
         max_raw_chunks_per_checker_call=max_raw_chunks_per_checker_call,
         max_new_raw_chunks_per_round=max_new_raw_chunks_per_round,
+        max_new_chunks_per_article=max_new_chunks_per_article,
+        max_visible_chunks_per_article=max_visible_chunks_per_article,
         limit=limit,
     )
     console = console or Console()
@@ -161,7 +200,13 @@ def run_evidence_loop_eval(
         )
         rerank_traces = load_rerank_trace_lookup(rerank_run_dir / "rerank_traces.jsonl")
         validate_qid_sets(candidate_rows, rerank_traces)
-        candidate_rows = filter_candidate_rows(candidate_rows, qids=qids, limit=limit)
+        candidate_rows = filter_candidate_rows(
+            candidate_rows,
+            rerank_traces=rerank_traces,
+            qids=qids,
+            source_case_prefixes=source_case_prefixes,
+            limit=limit,
+        )
     except (OSError, ValueError, RerankEvalError) as exc:
         raise EvidenceLoopEvalError(str(exc)) from exc
 
@@ -179,31 +224,45 @@ def run_evidence_loop_eval(
             model=llm_config["model"],
             timeout=llm_timeout,
         )
-        checker = TraceableEvidenceChecker(
+        checker_cls = (
+            CompactEvidenceChecker
+            if checker_mode == CHECKER_MODE_COMPACT
+            else TraceableEvidenceChecker
+        )
+        checker = checker_cls(
             client=checker_client,
             temperature=llm_temperature,
             max_tokens=llm_max_tokens,
             max_next_queries=max_queries_per_round,
             context_preview_chars=context_preview_chars,
         )
-    if reranker is None:
-        try:
-            reranker = CrossEncoderReranker(
-                model_name=reranker_model_name,
-                local_files_only=reranker_local_files_only,
-                device=device,
-                instruction=reranker_instruction,
-                max_length=reranker_max_length,
-            )
-        except CrossEncoderRerankerError as exc:
-            raise EvidenceLoopEvalError(str(exc)) from exc
+        if checker_retry_attempts > 1:
+            checker = RetryingEvidenceChecker(checker, max_attempts=checker_retry_attempts)
+    reranker_config = build_loop_reranker(
+        reranker=reranker,
+        provider=reranker_provider,
+        model_name=reranker_model_name,
+        local_files_only=reranker_local_files_only,
+        device=device,
+        instruction=reranker_instruction,
+        max_length=reranker_max_length,
+        dashscope_url=dashscope_rerank_url,
+        dashscope_api_key=dashscope_rerank_api_key,
+        dashscope_model=dashscope_rerank_model,
+        dashscope_timeout=dashscope_rerank_timeout,
+    )
+    reranker = reranker_config["reranker"]
+    effective_reranker_model_name = reranker_config["model_name"]
 
     loop_config = EvidenceLoopConfig(
         max_rounds=max_rounds,
+        min_retrieval_rounds=min_retrieval_rounds,
         max_queries_per_round=max_queries_per_round,
         per_query_retrieve_top_k_chunks=second_hop_top_k_chunks,
         max_raw_chunks_per_checker_call=max_raw_chunks_per_checker_call,
         max_new_raw_chunks_per_round=max_new_raw_chunks_per_round,
+        max_new_chunks_per_article=max_new_chunks_per_article,
+        max_visible_chunks_per_article=max_visible_chunks_per_article,
         rerank_batch_size=reranker_batch_size,
         budget=ContextBudgetConfig(model_context_window_tokens=model_context_window_tokens),
     )
@@ -270,6 +329,7 @@ def run_evidence_loop_eval(
         rerank_metrics=rerank_metrics,
         candidate_rows=candidate_rows,
         active_top_k_chunks=max_raw_chunks_per_checker_call,
+        checker_mode=checker_mode,
     )
     run_dir = ensure_dir(
         Path(output_dir)
@@ -277,10 +337,12 @@ def run_evidence_loop_eval(
         / rerank_run_dir.name
         / build_run_name(
             llm_model=llm_config["model"],
-            reranker_model_name=reranker_model_name,
+            reranker_model_name=effective_reranker_model_name,
             second_hop_top_k_chunks=second_hop_top_k_chunks,
             model_context_window_tokens=model_context_window_tokens,
             max_raw_chunks_per_checker_call=max_raw_chunks_per_checker_call,
+            min_retrieval_rounds=min_retrieval_rounds,
+            checker_mode=checker_mode,
         )
     )
     write_outputs(
@@ -303,26 +365,38 @@ def run_evidence_loop_eval(
             "rrf_k": rrf_k,
             "bm25_weight": bm25_weight,
             "dense_weight": dense_weight,
+            "reranker_provider": reranker_config["provider"],
             "reranker_model_name": reranker_model_name,
+            "effective_reranker_model_name": effective_reranker_model_name,
             "reranker_local_files_only": reranker_local_files_only,
             "reranker_batch_size": reranker_batch_size,
             "reranker_max_length": reranker_max_length,
             "reranker_instruction_name": reranker_instruction_name,
             "reranker_instruction": reranker_instruction,
+            "dashscope_rerank_url": reranker_config["dashscope_url"],
+            "dashscope_rerank_api_key_provided": reranker_config["dashscope_api_key_provided"],
+            "dashscope_rerank_model": reranker_config["dashscope_model"],
+            "dashscope_rerank_timeout": dashscope_rerank_timeout,
             "llm_base_url": llm_config["base_url"],
             "llm_api_key_provided": bool(llm_config["api_key"]),
             "llm_model": llm_config["model"],
             "llm_temperature": llm_temperature,
             "llm_max_tokens": llm_max_tokens,
             "llm_timeout": llm_timeout,
+            "checker_mode": checker_mode,
+            "checker_retry_attempts": checker_retry_attempts,
             "context_preview_chars": context_preview_chars,
             "model_context_window_tokens": model_context_window_tokens,
             "max_rounds": max_rounds,
+            "min_retrieval_rounds": min_retrieval_rounds,
             "max_queries_per_round": max_queries_per_round,
             "max_raw_chunks_per_checker_call": max_raw_chunks_per_checker_call,
             "max_new_raw_chunks_per_round": max_new_raw_chunks_per_round,
+            "max_new_chunks_per_article": max_new_chunks_per_article,
+            "max_visible_chunks_per_article": max_visible_chunks_per_article,
             "limit": limit,
             "qids": qids or [],
+            "source_case_prefixes": source_case_prefixes or [],
             "context_budget": model_to_dict(loop_config.budget),
         },
         traces=traces,
@@ -341,18 +415,25 @@ def validate_args(
     rrf_k: int,
     bm25_weight: float,
     dense_weight: float,
+    reranker_provider: str,
     dense_query_batch_size: int,
     reranker_batch_size: int,
     reranker_max_length: int,
+    dashscope_rerank_timeout: float,
     llm_temperature: float,
     llm_max_tokens: int,
     llm_timeout: float,
+    checker_mode: str,
+    checker_retry_attempts: int,
     context_preview_chars: int,
     model_context_window_tokens: int,
     max_rounds: int,
+    min_retrieval_rounds: int,
     max_queries_per_round: int,
     max_raw_chunks_per_checker_call: int,
     max_new_raw_chunks_per_round: int,
+    max_new_chunks_per_article: int,
+    max_visible_chunks_per_article: int,
     limit: int | None,
 ) -> None:
     positive_values = {
@@ -368,12 +449,26 @@ def validate_args(
         "max_queries_per_round": max_queries_per_round,
         "max_raw_chunks_per_checker_call": max_raw_chunks_per_checker_call,
         "max_new_raw_chunks_per_round": max_new_raw_chunks_per_round,
+        "max_new_chunks_per_article": max_new_chunks_per_article,
+        "max_visible_chunks_per_article": max_visible_chunks_per_article,
     }
     for name, value in positive_values.items():
         if value <= 0:
             raise EvidenceLoopEvalError(f"{name} must be positive.")
     if max_rounds < 0:
         raise EvidenceLoopEvalError("max_rounds must be non-negative.")
+    if min_retrieval_rounds < 0:
+        raise EvidenceLoopEvalError("min_retrieval_rounds must be non-negative.")
+    if min_retrieval_rounds > max_rounds:
+        raise EvidenceLoopEvalError("min_retrieval_rounds cannot exceed max_rounds.")
+    if reranker_provider not in VALID_RERANKER_PROVIDERS:
+        raise EvidenceLoopEvalError(
+            f"reranker_provider must be one of {sorted(VALID_RERANKER_PROVIDERS)}."
+        )
+    if checker_mode not in VALID_CHECKER_MODES:
+        raise EvidenceLoopEvalError(f"checker_mode must be one of {sorted(VALID_CHECKER_MODES)}.")
+    if checker_retry_attempts <= 0:
+        raise EvidenceLoopEvalError("checker_retry_attempts must be positive.")
     if limit is not None and limit <= 0:
         raise EvidenceLoopEvalError("limit must be positive when provided.")
     if second_hop_top_k_chunks > branch_top_k_chunks:
@@ -385,19 +480,124 @@ def validate_args(
     for name, value in (
         ("bm25_weight", bm25_weight),
         ("dense_weight", dense_weight),
+        ("dashscope_rerank_timeout", dashscope_rerank_timeout),
         ("llm_temperature", llm_temperature),
         ("llm_timeout", llm_timeout),
     ):
         if not math.isfinite(value) or value < 0:
             raise EvidenceLoopEvalError(f"{name} must be a non-negative finite number.")
-    if bm25_weight == 0 or dense_weight == 0 or llm_timeout == 0:
-        raise EvidenceLoopEvalError("bm25_weight, dense_weight, and llm_timeout must be positive.")
+    if bm25_weight == 0 or dense_weight == 0 or llm_timeout == 0 or dashscope_rerank_timeout == 0:
+        raise EvidenceLoopEvalError(
+            "bm25_weight, dense_weight, llm_timeout, and dashscope_rerank_timeout must be positive."
+        )
+
+
+def build_loop_reranker(
+    *,
+    reranker: Any | None,
+    provider: str,
+    model_name: str,
+    local_files_only: bool,
+    device: str | None,
+    instruction: str,
+    max_length: int,
+    dashscope_url: str | None,
+    dashscope_api_key: str | None,
+    dashscope_model: str | None,
+    dashscope_timeout: float,
+) -> dict[str, Any]:
+    if reranker is not None:
+        model = compact_text(model_name) or compact_text(getattr(reranker, "model_name", "")) or "custom_reranker"
+        return {
+            "reranker": reranker,
+            "provider": "custom",
+            "model_name": model,
+            "dashscope_url": "",
+            "dashscope_model": "",
+            "dashscope_api_key_provided": False,
+        }
+
+    if provider == RERANKER_PROVIDER_LOCAL:
+        try:
+            return {
+                "reranker": CrossEncoderReranker(
+                    model_name=model_name,
+                    local_files_only=local_files_only,
+                    device=device,
+                    instruction=instruction,
+                    max_length=max_length,
+                ),
+                "provider": RERANKER_PROVIDER_LOCAL,
+                "model_name": model_name,
+                "dashscope_url": "",
+                "dashscope_model": "",
+                "dashscope_api_key_provided": False,
+            }
+        except CrossEncoderRerankerError as exc:
+            raise EvidenceLoopEvalError(str(exc)) from exc
+
+    if provider == RERANKER_PROVIDER_DASHSCOPE:
+        config = resolve_dashscope_reranker_config(
+            url=dashscope_url,
+            api_key=dashscope_api_key,
+            model=dashscope_model,
+        )
+        try:
+            reranker = DashScopeReranker(
+                url=config["url"],
+                api_key=config["api_key"],
+                model=config["model"],
+                instruction=instruction,
+                timeout=dashscope_timeout,
+            )
+        except DashScopeRerankerError as exc:
+            raise EvidenceLoopEvalError(str(exc)) from exc
+        return {
+            "reranker": reranker,
+            "provider": RERANKER_PROVIDER_DASHSCOPE,
+            "model_name": f"dashscope/{config['model']}",
+            "dashscope_url": config["url"],
+            "dashscope_model": config["model"],
+            "dashscope_api_key_provided": bool(config["api_key"]),
+        }
+
+    raise EvidenceLoopEvalError(f"Unsupported reranker_provider: {provider}.")
+
+
+def resolve_dashscope_reranker_config(
+    *,
+    url: str | None,
+    api_key: str | None,
+    model: str | None,
+) -> dict[str, str]:
+    resolved_url = first_text(url, os.environ.get("DASHSCOPE_RERANK_URL"), dashscope_rerank_url_from_env())
+    resolved_api_key = first_text(
+        api_key,
+        os.environ.get("DASHSCOPE_RERANK_API_KEY"),
+        os.environ.get("DASHSCOPE_API_KEY"),
+    )
+    resolved_model = first_text(
+        model,
+        os.environ.get("DASHSCOPE_RERANK_MODEL"),
+        dashscope_rerank_model_from_env(),
+        DEFAULT_DASHSCOPE_RERANK_MODEL,
+    )
+    if not resolved_api_key:
+        raise EvidenceLoopEvalError(
+            "DashScope reranker api key is required. Set DASHSCOPE_RERANK_API_KEY "
+            "or DASHSCOPE_API_KEY, or pass --dashscope_rerank_api_key."
+        )
+    if not resolved_url:
+        resolved_url = DEFAULT_DASHSCOPE_RERANK_URL
+    return {"url": resolved_url, "api_key": resolved_api_key, "model": resolved_model}
 
 
 def filter_candidate_rows(
     rows: list[dict[str, Any]],
     *,
+    rerank_traces: dict[str, dict[str, Any]] | None = None,
     qids: list[str] | None,
+    source_case_prefixes: list[str] | None = None,
     limit: int | None,
 ) -> list[dict[str, Any]]:
     output = rows
@@ -407,6 +607,16 @@ def filter_candidate_rows(
         missing = sorted(qid_set - {row["qid"] for row in output})
         if missing:
             raise EvidenceLoopEvalError(f"Requested qids not found: {missing[:5]}.")
+    if source_case_prefixes:
+        prefixes = tuple(prefix.strip() for prefix in source_case_prefixes if prefix.strip())
+        if prefixes:
+            if rerank_traces is None:
+                raise EvidenceLoopEvalError("source_case_prefixes requires rerank traces.")
+            output = [
+                row
+                for row in output
+                if str(rerank_traces[row["qid"]].get("case_type") or "").startswith(prefixes)
+            ]
     if limit is not None:
         output = output[:limit]
     if not output:
@@ -424,12 +634,23 @@ def resolve_llm_config(
 ) -> dict[str, str]:
     model_from_checker = compact_text(getattr(checker, "model", "")) if checker else ""
     model_from_client = compact_text(getattr(checker_client, "model", "")) if checker_client else ""
-    base_url = first_text(llm_base_url, os.environ.get("LLM_BASE_URL"), os.environ.get("OPENAI_BASE_URL"))
-    api_key = first_text(llm_api_key, os.environ.get("LLM_API_KEY"), os.environ.get("OPENAI_API_KEY"))
+    base_url = first_text(
+        llm_base_url,
+        os.environ.get("LLM_BASE_URL"),
+        os.environ.get("OPENAI_BASE_URL"),
+        deepseek_base_url_from_env(),
+    )
+    api_key = first_text(
+        llm_api_key,
+        os.environ.get("LLM_API_KEY"),
+        os.environ.get("OPENAI_API_KEY"),
+        os.environ.get("DEEPSEEK_API_KEY"),
+    )
     model = first_text(
         llm_model,
         os.environ.get("LLM_MODEL"),
         os.environ.get("OPENAI_MODEL"),
+        os.environ.get("DEEPSEEK_MODEL"),
         model_from_checker,
         model_from_client,
     )
@@ -472,8 +693,12 @@ class HybridLoopRetrieverAdapter:
         self.dense_query_batch_size = dense_query_batch_size
 
     def search(self, query_text: str, *, top_k_chunks: int) -> list[dict[str, Any]]:
+        batches = self.search_batch([query_text], top_k_chunks=top_k_chunks)
+        return batches[0] if batches else []
+
+    def search_batch(self, queries: list[str], *, top_k_chunks: int) -> list[list[dict[str, Any]]]:
         batches = self.retriever.search_batch(
-            [query_text],
+            queries,
             branch_top_k_chunks=self.branch_top_k_chunks,
             fused_top_k_chunks=top_k_chunks,
             rrf_k=self.rrf_k,
@@ -481,9 +706,12 @@ class HybridLoopRetrieverAdapter:
             dense_weight=self.dense_weight,
             dense_query_batch_size=self.dense_query_batch_size,
         )
-        if len(batches) != 1:
-            raise HybridRetrieverError("Hybrid retriever returned an unexpected batch count.")
-        return batches[0]["hybrid"][:top_k_chunks]
+        if len(batches) != len(queries):
+            raise HybridRetrieverError(
+                "Hybrid retriever returned an unexpected batch count: "
+                f"results={len(batches)}, queries={len(queries)}."
+            )
+        return [list(batch["hybrid"][:top_k_chunks]) for batch in batches]
 
 
 def build_loop_retriever_adapter(
@@ -530,6 +758,12 @@ def build_loop_trace(
     ks = select_chunk_ks(active_top_k_chunks)
     metrics = compute_chunk_retrieval_metrics(example.article_ids, final_results, ks)
     final_article_ids = [row["article_id"] for row in final_results]
+    baseline_top10_article_ids = [row["article_id"] for row in rerank_trace["top10_reranked_chunks"]]
+    source_candidate_article_ids = [
+        row["article_id"]
+        for row in candidate_row.get("hybrid_candidates", [])
+        if row.get("article_id")
+    ]
     source_case_type = rerank_trace.get("case_type")
     checker_outputs = loop_result.checker_outputs
     invalid_provenance_chunk_ids = sorted(
@@ -542,6 +776,24 @@ def build_loop_trace(
     prompt_manifest_rows = [model_to_dict(row) for row in loop_result.prompt_manifests]
     usage_snapshot_rows = [model_to_dict(row) for row in loop_result.usage_snapshots]
     compact_boundary_rows = [model_to_dict(row) for row in loop_result.compact_boundaries]
+    gap_query_rows = [model_to_dict(row) for row in context.gap_query_provenance]
+    second_hop_retrieved_article_ids = unique_texts(
+        article_id
+        for row in gap_query_rows
+        for article_id in row.get("retrieved_article_ids", [])
+    )
+    second_hop_candidate_article_ids = unique_texts(
+        article_id
+        for row in gap_query_rows
+        for article_id in row.get("candidate_article_ids", [])
+    )
+    second_hop_selected_article_ids = unique_texts(
+        article_id
+        for row in gap_query_rows
+        for article_id in row.get("selected_article_ids", [])
+    )
+    baseline_missing_article_ids = missing_article_ids(example.article_ids, baseline_top10_article_ids)
+    final_missing_article_ids = missing_article_ids(example.article_ids, final_article_ids)
     trace = {
         "qid": context.qid,
         "dataset_name": context.dataset_name,
@@ -552,20 +804,36 @@ def build_loop_trace(
         "is_multi_article": example.is_multi_article,
         "source_case_type": source_case_type,
         "baseline_top10_chunk_ids": [row["chunk_id"] for row in rerank_trace["top10_reranked_chunks"]],
-        "baseline_top10_article_ids": [row["article_id"] for row in rerank_trace["top10_reranked_chunks"]],
+        "baseline_top10_article_ids": baseline_top10_article_ids,
+        "baseline_missing_article_ids": baseline_missing_article_ids,
+        "source_candidate_article_ids": unique_texts(source_candidate_article_ids),
+        "source_candidate_full_article_hit": is_full_article_hit(example.article_ids, source_candidate_article_ids),
         "final_active_chunk_ids": [row["chunk_id"] for row in final_results],
         "final_active_article_ids": final_article_ids,
+        "final_missing_article_ids": final_missing_article_ids,
         "final_context_top_k_chunks": active_top_k_chunks,
         "baseline_context_full_article_hit": is_full_article_hit(
             example.article_ids,
-            [row["article_id"] for row in rerank_trace["top10_reranked_chunks"]],
+            baseline_top10_article_ids,
         ),
         "final_context_full_article_hit": is_full_article_hit(example.article_ids, final_article_ids),
         "final_case_type": classify_chunk_case(example.article_ids, final_article_ids, active_top_k_chunks),
+        "second_hop_retrieved_article_ids": second_hop_retrieved_article_ids,
+        "second_hop_candidate_article_ids": second_hop_candidate_article_ids,
+        "second_hop_selected_article_ids": second_hop_selected_article_ids,
+        "second_hop_retrieved_missing_article_ids": [
+            article_id for article_id in baseline_missing_article_ids if article_id in second_hop_retrieved_article_ids
+        ],
+        "second_hop_selected_missing_article_ids": [
+            article_id for article_id in baseline_missing_article_ids if article_id in second_hop_selected_article_ids
+        ],
         "candidate_items_count": len(context.candidate_items),
         "rounds_completed": loop_result.rounds_completed,
         "completed": loop_result.completed,
         "checker_call_count": len(checker_outputs),
+        "minimum_retrieval_forced_count": sum(
+            bool(output.get("minimum_retrieval_forced")) for output in checker_outputs
+        ),
         "retrieval_rounds": loop_result.retrieval_rounds,
         "second_hop_query_count": loop_result.second_hop_query_count,
         "prompt_manifests": prompt_manifest_rows,
@@ -573,7 +841,7 @@ def build_loop_trace(
         "compact_boundaries": compact_boundary_rows,
         "checker_outputs": checker_outputs,
         "query_history": context.query_history,
-        "gap_query_provenance": [model_to_dict(row) for row in context.gap_query_provenance],
+        "gap_query_provenance": gap_query_rows,
         "llm_seen_chunk_ids": sorted(
             {
                 chunk_id
@@ -592,6 +860,7 @@ def build_loop_trace(
     }
     trace["case_type"] = trace["final_case_type"]
     trace.update({key: value for key, value in metrics.items() if key != "is_valid"})
+    trace["failure_stage"] = classify_failure_stage(trace)
     return trace
 
 
@@ -614,6 +883,7 @@ def summarize_loop_traces(
     rerank_metrics: dict[str, Any],
     candidate_rows: list[dict[str, Any]],
     active_top_k_chunks: int,
+    checker_mode: str = CHECKER_MODE_TRACEABLE,
 ) -> dict[str, Any]:
     valid_rows = [trace for trace in traces if trace["final_case_type"] != CASE_INVALID]
     invalid_rows = [trace for trace in traces if trace["final_case_type"] == CASE_INVALID]
@@ -633,9 +903,15 @@ def summarize_loop_traces(
         is_full_article_hit(row["gold_article_ids"], row["baseline_top10_article_ids"])
         for row in traces
     )
+    loop_name = (
+        "Compact EvidenceContext Loop"
+        if checker_mode == CHECKER_MODE_COMPACT
+        else "Traceable EvidenceContext Loop"
+    )
     summary.update(
         {
-            "retriever_type": "Traceable EvidenceContext Loop",
+            "retriever_type": loop_name,
+            "checker_mode": checker_mode,
             "retrieval_unit": "chunk",
             "source_rerank_chunk_full_article_hit@10": baseline_full,
             "sample_source_rerank_chunk_full_article_hit@10": sample_baseline_full,
@@ -647,6 +923,7 @@ def summarize_loop_traces(
             "delta_context_chunk_full_article_hit": final_context_full - baseline_full,
             "sample_delta_context_chunk_full_article_hit": final_context_full - sample_baseline_full,
             "completed_count": sum(row["completed"] for row in traces),
+            "minimum_retrieval_forced_count": sum(row["minimum_retrieval_forced_count"] for row in traces),
             "provenance_invalid_count": sum(not row["provenance_valid"] for row in traces),
             "avg_checker_calls": average(row["checker_call_count"] for row in traces),
             "avg_retrieval_rounds": average(row["retrieval_rounds"] for row in traces),
@@ -665,6 +942,7 @@ def summarize_loop_traces(
                 and row["final_context_full_article_hit"]
                 for row in traces
             ),
+            "failure_stage_counts": count_by_key(traces, "failure_stage"),
         }
     )
     return summary
@@ -673,6 +951,29 @@ def summarize_loop_traces(
 def is_full_article_hit(gold_article_ids: list[str], retrieved_article_ids: list[str]) -> bool:
     gold = set(gold_article_ids)
     return bool(gold) and gold.issubset(set(retrieved_article_ids))
+
+
+def missing_article_ids(gold_article_ids: list[str], retrieved_article_ids: list[str]) -> list[str]:
+    retrieved = set(retrieved_article_ids)
+    return [article_id for article_id in gold_article_ids if article_id not in retrieved]
+
+
+def classify_failure_stage(trace: dict[str, Any]) -> str:
+    if trace["final_context_full_article_hit"]:
+        return "rescued"
+    if trace["baseline_context_full_article_hit"]:
+        return "already_full"
+    if trace["checker_call_count"] <= 1 and trace["second_hop_query_count"] == 0:
+        return "checker_stopped_without_retrieval"
+    if trace["second_hop_query_count"] == 0:
+        return "checker_no_query"
+    if not trace["second_hop_retrieved_missing_article_ids"]:
+        return "retrieval_missing_gold"
+    if not trace["second_hop_selected_missing_article_ids"]:
+        return "reranker_or_diversity_missed_gold"
+    if not trace["completed"]:
+        return "max_rounds_still_insufficient"
+    return "packing_or_metric_missed_gold"
 
 
 def write_outputs(
@@ -704,11 +1005,17 @@ def write_outputs(
         run_dir / "cases_invalid_provenance.jsonl",
         [row for row in traces if not row["provenance_valid"]],
     )
+    for failure_stage in sorted({row.get("failure_stage", "") for row in traces if row.get("failure_stage")}):
+        write_jsonl(
+            run_dir / f"cases_{safe_name(failure_stage)}.jsonl",
+            [row for row in traces if row.get("failure_stage") == failure_stage],
+        )
 
 
 def render_metrics_markdown(summary: dict[str, Any]) -> str:
     top_k_chunks = int(summary["final_context_top_k_chunks"])
-    lines = ["# Traceable EvidenceContext Loop", "", "## 基本信息", ""]
+    title = compact_text(summary.get("retriever_type")) or "EvidenceContext Loop"
+    lines = [f"# {title}", "", "## 基本信息", ""]
     lines.extend(
         markdown_table(
             ["指标", "数值"],
@@ -724,6 +1031,7 @@ def render_metrics_markdown(summary: dict[str, Any]) -> str:
                 [f"delta_context@{top_k_chunks}_vs_global", f"{summary['delta_context_chunk_full_article_hit']:.4f}"],
                 [f"delta_context@{top_k_chunks}_sample", f"{summary['sample_delta_context_chunk_full_article_hit']:.4f}"],
                 ["completed_count", summary["completed_count"]],
+                ["minimum_retrieval_forced_count", summary["minimum_retrieval_forced_count"]],
                 ["provenance_invalid_count", summary["provenance_invalid_count"]],
                 ["avg_checker_calls", f"{summary['avg_checker_calls']:.2f}"],
                 ["avg_retrieval_rounds", f"{summary['avg_retrieval_rounds']:.2f}"],
@@ -736,6 +1044,14 @@ def render_metrics_markdown(summary: dict[str, Any]) -> str:
             ],
         )
     )
+    if summary.get("failure_stage_counts"):
+        lines.extend(["", "## Failure Stage Counts", ""])
+        lines.extend(
+            markdown_table(
+                ["failure_stage", "count"],
+                [[key, value] for key, value in sorted(summary["failure_stage_counts"].items())],
+            )
+        )
     lines.extend(["", "## Final Context 指标", ""])
     lines.extend(
         markdown_table(
@@ -773,12 +1089,19 @@ def build_run_name(
     second_hop_top_k_chunks: int,
     model_context_window_tokens: int,
     max_raw_chunks_per_checker_call: int,
+    min_retrieval_rounds: int = 0,
+    checker_mode: str = CHECKER_MODE_TRACEABLE,
 ) -> str:
-    return (
+    name = (
         f"loop_{safe_name(llm_model)}_h{second_hop_top_k_chunks}_"
         f"{safe_name(reranker_model_name)}_w{max_raw_chunks_per_checker_call}_"
         f"ctx{model_context_window_tokens // 1024}k"
     )
+    if min_retrieval_rounds:
+        name += f"_rmin{min_retrieval_rounds}"
+    if checker_mode != CHECKER_MODE_TRACEABLE:
+        name += f"_{safe_name(checker_mode)}"
+    return name
 
 
 def safe_name(value: str) -> str:
@@ -790,6 +1113,23 @@ def safe_name(value: str) -> str:
     return output.strip("-") or "model"
 
 
-def average(values: Any) -> float:
-    items = list(values)
-    return sum(float(value) for value in items) / len(items) if items else 0.0
+def count_by_key(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = str(row.get(key) or "")
+        if not value:
+            continue
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def unique_texts(values: Any) -> list[str]:
+    output = []
+    seen = set()
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        output.append(text)
+    return output

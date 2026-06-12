@@ -1,10 +1,10 @@
 # WixQA Agentic RAG
 
-面向企业客服知识库，后续实现证据补全式 Agentic RAG。
+面向企业客服知识库的证据补全式 Agentic RAG 系统。
 
-当前阶段：**LLM gap-query merged-pool rerank loop**。
+当前阶段：**Evidence Completion Loop + 多 Agent 对话 Web Console**。
 
-当前仓库已经完成数据接入、数据统计、三类 chunk-level retrieval baseline、Qwen3 重排基线、错误分析、无 LLM 的规则补检索和 LLM checker 评测代码：
+当前仓库已经完成数据接入、数据统计、三类 chunk-level retrieval baseline、Qwen3 重排基线、错误分析、规则补检索、LLM checker 评测、Evidence Completion Loop、多 Agent 对话链路和 Web Console：
 
 ```text
 chunk-level BM25
@@ -14,10 +14,14 @@ Qwen/Qwen3-Reranker-0.6B over saved Hybrid chunks
 rule-based title-expanded second-hop retrieval
 LLM evidence sufficiency checker + gap-query pool eval
 LLM gap-query merged pool + Qwen3 rerank eval
+iterative Evidence Completion Loop with provenance and context budget
+Dialogue / Query / Evidence / Answer / Verifier agents
+local NDJSON-streaming Web Console
 ```
 
-Phase 8 只做 pool-level eval：LLM 生成 gap queries 后检查合并候选池覆盖，不做最终 merged-pool rerank、答案生成或 Agent 循环。
-Phase 9 复用 Phase 8 merged pool，不重新调用 LLM 或检索，只用 Qwen3 reranker 评估最终 top10，并额外输出 top20 诊断指标。
+历史 Route A 中，Phase 8 只做 pool-level eval：LLM 生成 gap queries 后检查合并候选池覆盖，不做最终 merged-pool rerank、答案生成或 Agent 循环。Phase 9 复用 Phase 8 merged pool，不重新调用 LLM 或检索，只用 Qwen3 reranker 评估最终 top10，并额外输出 top20 诊断指标。
+
+当前在线链路在 Route B 的 Evidence Completion Loop 基础上，串联 Dialogue Agent、Query Agent、Evidence Agent、Answer Agent 和 Verifier Agent，并通过本地 Web Console 展示每一轮检索、重排、证据校验、答案生成和验证事件。
 
 ## 数据集
 
@@ -68,10 +72,33 @@ wixqa-agentic-rag/
 │   │   ├── rule_second_hop.py
 │   │   └── tokenizer.py
 │   ├── rerankers/
-│   │   └── cross_encoder_reranker.py
+│   │   ├── cross_encoder_reranker.py
+│   │   └── dashscope_reranker.py
 │   ├── llm/
+│   │   ├── answer_fallback.py
+│   │   ├── answer_generator.py
+│   │   ├── chat_client.py
 │   │   └── evidence_checker.py
+│   ├── agentic/
+│   │   ├── agents/
+│   │   │   ├── answer_agent.py
+│   │   │   ├── dialogue_agent.py
+│   │   │   ├── evidence_agent.py
+│   │   │   ├── query_agent.py
+│   │   │   └── verifier_agent.py
+│   │   ├── dialogue_orchestrator.py
+│   │   ├── dialogue_state.py
+│   │   ├── evidence_context.py
+│   │   ├── evidence_loop.py
+│   │   ├── evidence_selection.py
+│   │   ├── intent_gate.py
+│   │   ├── provenance.py
+│   │   └── runtime_factory.py
+│   ├── web/
+│   │   ├── server.py
+│   │   └── static/
 │   ├── utils/
+│   │   ├── env_utils.py
 │   │   ├── io_utils.py
 │   │   └── text_utils.py
 │   └── evaluation/
@@ -99,7 +126,9 @@ wixqa-agentic-rag/
 │   ├── run_error_analysis.py
 │   ├── run_rule_second_hop.py
 │   ├── run_llm_evidence_checker.py
-│   └── run_agentic_rerank_loop.py
+│   ├── run_agentic_rerank_loop.py
+│   ├── run_evidence_loop_eval.py
+│   └── run_dialogue_web.py
 ├── indexes/
 │   └── faiss_bge_m3/
 └── outputs/
@@ -128,6 +157,26 @@ pip install -r requirements.txt
 ```
 
 ## 运行
+
+启动多 Agent Web Console（真实链路）：
+
+```bash
+conda run -n wixqa-agentic-rag python scripts/run_dialogue_web.py --mode real --port 8765
+```
+
+打开：
+
+```text
+http://127.0.0.1:8765
+```
+
+真实模式会加载本地 chunks、FAISS index、Hybrid retriever、reranker 和 `.env` 中配置的 OpenAI-compatible LLM。快速检查 UI 和事件流时可以使用 demo 模式，不依赖本地索引或外部 API：
+
+```bash
+conda run -n wixqa-agentic-rag python scripts/run_dialogue_web.py --mode demo --port 8765
+```
+
+更详细的 Web Console 参数见 [WEB_CONSOLE.md](WEB_CONSOLE.md)。
 
 查看数据配置、数据划分、字段名和样例：
 

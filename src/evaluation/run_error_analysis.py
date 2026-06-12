@@ -9,6 +9,7 @@ from src.data.schema import KBArticle
 from src.evaluation.chunk_eval import chunk_case_labels
 from src.evaluation.eval_utils import CASE_INVALID, BM25EvalError, load_kb_articles, markdown_table
 from src.utils.io_utils import ensure_dir, read_json, read_jsonl, write_json, write_jsonl
+from src.utils.metrics import average
 
 
 DEFAULT_RERANK_RUN_DIR = (
@@ -554,13 +555,6 @@ def print_summary(console: Console, summary: dict[str, Any], output_dir: Path) -
     console.print(f"case_C_count: {summary['case_C_count']}")
     console.print()
     console.print(f"Results saved to {output_dir}/")
-
-
-def average(values: Any) -> float:
-    value_list = list(values)
-    if not value_list:
-        return 0.0
-    return sum(float(value) for value in value_list) / len(value_list)
 
 
 def safe_div(numerator: int | float, denominator: int | float) -> float:

@@ -29,7 +29,6 @@ from src.evaluation.run_rule_second_hop_eval import (
     DEFAULT_FIRST_HOP_TOP_K_CHUNKS,
     DEFAULT_RERANK_BATCH_SIZE,
     RuleSecondHopEvalError,
-    average,
     count_true,
     load_json_object,
     load_optional_top100_control,
@@ -45,6 +44,7 @@ from src.rerankers.cross_encoder_reranker import (
     CrossEncoderReranker,
     CrossEncoderRerankerError,
 )
+from src.utils.metrics import average
 from src.retrievers.rule_second_hop import RuleSecondHopError, merge_chunk_candidates
 from src.utils.io_utils import ensure_dir, read_jsonl, write_json, write_jsonl
 from src.utils.text_utils import compact_text

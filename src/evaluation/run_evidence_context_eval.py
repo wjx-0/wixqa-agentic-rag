@@ -31,6 +31,7 @@ from src.evaluation.run_rerank_eval import (
     load_required_json,
 )
 from src.utils.io_utils import ensure_dir, model_to_dict, read_jsonl, write_json, write_jsonl
+from src.utils.metrics import average
 
 
 DEFAULT_RERANK_RUN_DIR = (
@@ -449,8 +450,3 @@ def print_summary(console: Console, summary: dict[str, Any], run_dir: Path) -> N
         f"full@10={summary['chunk_full_article_hit@10']:.4f} "
         f"run_dir={run_dir}"
     )
-
-
-def average(values: Any) -> float:
-    items = list(values)
-    return sum(float(value) for value in items) / len(items) if items else 0.0

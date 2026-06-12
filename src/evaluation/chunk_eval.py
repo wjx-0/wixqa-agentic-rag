@@ -4,6 +4,7 @@ from typing import Any
 
 from src.data.schema import KBArticle, QAExample
 from src.evaluation.eval_utils import CASE_INVALID
+from src.utils.metrics import average
 
 
 CHUNK_KS = [1, 3, 5, 10, 20, 30, 50, 100]
@@ -204,10 +205,3 @@ def group_rows(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     for row in rows:
         grouped["multi" if row.get("is_multi_article") else "single"].append(row)
     return grouped
-
-
-def average(values: Any) -> float:
-    value_list = list(values)
-    if not value_list:
-        return 0.0
-    return sum(float(value) for value in value_list) / len(value_list)

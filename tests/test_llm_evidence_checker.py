@@ -14,11 +14,18 @@ from src.evaluation.run_llm_evidence_checker_eval import (
     validate_candidate_baseline_qids,
 )
 from src.llm.evidence_checker import (
+    CHECKER_MODE_COMPACT,
+    CompactEvidenceChecker,
     OpenAICompatibleChatClient,
+    RetryingEvidenceChecker,
     TraceableEvidenceChecker,
+    apply_runtime_sufficiency_guards,
+    augment_runtime_queries,
+    build_compact_evidence_checker_messages,
     build_evidence_checker_messages,
     build_traceable_evidence_checker_messages,
     parse_checker_response,
+    parse_compact_checker_response,
     parse_traceable_checker_response,
 )
 from src.utils.io_utils import read_json, read_jsonl, write_json, write_jsonl
@@ -129,7 +136,7 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
         self.assertEqual(parsed["nice_to_have_missing_evidence"], ["extra screenshot"])
         self.assertEqual(parsed["next_queries"], ["Wix GA4 setup", "Wix Tag Manager"])
 
-    def test_traceable_checker_schema_cites_visible_chunk_ids(self) -> None:
+    def test_traceable_checker_schema_cites_visible_chunk_aliases(self) -> None:
         messages = build_traceable_evidence_checker_messages(
             "How do I connect GA4?",
             [
@@ -144,37 +151,55 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
         )
         prompt = "\n".join(message["content"] for message in messages)
 
-        self.assertIn("Chunk ID: chunk_a", prompt)
+        self.assertIn("Chunk Ref: C1", prompt)
+        self.assertNotIn("Chunk ID: chunk_a", prompt)
+        self.assertNotIn("Snippet ID", prompt)
+        self.assertNotIn("chunk_a:tokens", prompt)
         self.assertIn("supporting_chunk_ids", prompt)
         self.assertIn("derived_from_chunk_ids", prompt)
         self.assertIn("Reason internally if useful", prompt)
         self.assertIn("every core facet", prompt)
+        self.assertIn("required_facets as a compact coverage matrix", prompt)
+        self.assertIn("exact_object_match=false", prompt)
         self.assertIn("multi-intent questions", prompt)
         self.assertIn("service-selling questions", prompt)
+        self.assertIn("Do not invent bridge facts", prompt)
+        self.assertIn("course, class, lesson", prompt)
+        self.assertIn("domain plus Premium plan", prompt)
         self.assertIn("pricing, cost, fee, or upgrade questions", prompt)
         self.assertIn("nice-to-have details", prompt)
         self.assertIn("missing_facets must list only blocking gaps", prompt)
-        self.assertIn("one to three strongest chunk_ids", prompt)
+        self.assertIn("one to three strongest Chunk Ref aliases", prompt)
         self.assertNotIn("gold_article_ids", prompt)
 
         parsed = parse_traceable_checker_response(
             """
             {
               "sufficient": false,
-              "seen_chunk_ids": ["chunk_a"],
+              "seen_chunk_ids": ["C1"],
+              "required_facets": [
+                {
+                  "facet_id": "facet_1",
+                  "facet_type": "integration",
+                  "user_need": "connect GA4",
+                  "evidence_status": "covered",
+                  "exact_object_match": true,
+                  "supporting_chunk_ids": ["C1"]
+                }
+              ],
               "known_facts": ["GA4 is mentioned"],
               "covered_facets": [
                 {
                   "facet_id": "facet_1",
                   "description": "analytics connection",
-                  "supporting_chunk_ids": ["chunk_a"]
+                  "supporting_chunk_ids": ["C1"]
                 }
               ],
               "missing_facets": [
                 {
                   "facet_id": "facet_2",
                   "description": "property setup",
-                  "inferred_from_chunk_ids": ["chunk_a"],
+                  "inferred_from_chunk_ids": ["1"],
                   "blocking": true
                 }
               ],
@@ -182,30 +207,499 @@ class LLMEvidenceCheckerTest(unittest.TestCase):
                 {
                   "query_text": "Wix GA4 property setup",
                   "target_missing_facet_id": "facet_2",
-                  "derived_from_chunk_ids": ["chunk_a"]
+                  "derived_from_chunk_ids": ["C1"]
                 },
                 {
                   "query_text": "Wix GA4 measurement ID",
                   "target_missing_facet_id": "facet_2",
-                  "derived_from_chunk_ids": ["missing_chunk"]
+                  "derived_from_chunk_ids": ["C99"]
                 },
                 {
                   "query_text": "ignored third query",
                   "target_missing_facet_id": "facet_2",
-                  "derived_from_chunk_ids": ["chunk_a"]
+                  "derived_from_chunk_ids": ["C1"]
                 }
               ],
               "reason": "Need setup details"
             }
             """,
             allowed_chunk_ids=["chunk_a"],
+            chunk_id_aliases={"C1": "chunk_a"},
             max_next_queries=2,
         )
 
         self.assertFalse(parsed["sufficient"])
+        self.assertEqual(parsed["seen_chunk_ids"], ["chunk_a"])
+        self.assertEqual(parsed["required_facets"][0]["supporting_chunk_ids"], ["chunk_a"])
+        self.assertEqual(parsed["covered_facets"][0]["supporting_chunk_ids"], ["chunk_a"])
+        self.assertEqual(parsed["missing_facets"][0]["inferred_from_chunk_ids"], ["chunk_a"])
         self.assertEqual(len(parsed["next_queries"]), 2)
+        self.assertEqual(parsed["next_queries"][0]["derived_from_chunk_ids"], ["chunk_a"])
         self.assertFalse(parsed["provenance_valid"])
-        self.assertEqual(parsed["invalid_provenance_chunk_ids"], ["missing_chunk"])
+        self.assertEqual(parsed["invalid_provenance_chunk_ids"], ["C99"])
+
+    def test_compact_checker_schema_keeps_output_short(self) -> None:
+        messages = build_compact_evidence_checker_messages(
+            "How do I connect GA4?",
+            [
+                {
+                    "rank": 1,
+                    "chunk_id": "chunk_a",
+                    "title": "Google Analytics",
+                    "text_preview": "Connect analytics to a Wix site.",
+                }
+            ],
+            max_next_queries=1,
+        )
+        prompt = "\n".join(message["content"] for message in messages)
+
+        self.assertIn("fast evidence sufficiency checker", prompt)
+        self.assertIn("blocking_missing_evidence", prompt)
+        self.assertIn("next_queries", prompt)
+        self.assertNotIn("required_facets", prompt)
+        self.assertNotIn("supporting_chunk_ids", prompt)
+        self.assertNotIn("derived_from_chunk_ids", prompt)
+        self.assertNotIn("Chunk Ref", prompt)
+
+        parsed = parse_compact_checker_response(
+            """
+            {
+              "sufficient": false,
+              "blocking_missing_evidence": ["Need GA4 property setup steps"],
+              "next_queries": ["Wix GA4 property setup"],
+              "reason": "Setup steps are missing."
+            }
+            """,
+            max_next_queries=1,
+        )
+
+        self.assertFalse(parsed["sufficient"])
+        self.assertEqual(parsed["checker_mode"], CHECKER_MODE_COMPACT)
+        self.assertTrue(parsed["compact_checker"])
+        self.assertTrue(parsed["provenance_valid"])
+        self.assertEqual(parsed["missing_facets"][0]["description"], "Need GA4 property setup steps")
+        self.assertEqual(parsed["next_queries"][0]["query_text"], "Wix GA4 property setup")
+
+    def test_compact_checker_returns_loop_compatible_result(self) -> None:
+        client = FakeLLMClient(
+            [
+                '{"sufficient": false, '
+                '"blocking_missing_evidence": ["Need GA4 setup"], '
+                '"next_queries": ["Wix GA4 setup"], "reason": "Missing setup."}'
+            ]
+        )
+        checker = CompactEvidenceChecker(client=client, max_next_queries=1)
+        item = type(
+            "Item",
+            (),
+            {
+                "chunk_id": "chunk_a",
+                "rank": 1,
+                "title": "Google Analytics",
+                "text_preview": "Connect analytics.",
+            },
+        )()
+        context = type("Context", (), {"question": "How do I connect GA4?", "query_history": []})()
+        manifest = type("Manifest", (), {"llm_call_id": "call"})()
+
+        result = checker.check(
+            context=context,
+            visible_items=[item],
+            manifest=manifest,
+            round_index=0,
+        )
+
+        self.assertTrue(result["checker_valid"])
+        self.assertEqual(result["checker_mode"], CHECKER_MODE_COMPACT)
+        self.assertTrue(result["retrieval_triggered"])
+        self.assertIn("GA4", result["next_queries"][0]["query_text"])
+        self.assertTrue(result["provenance_valid"])
+
+    def test_retrying_checker_retries_invalid_compact_response_once(self) -> None:
+        client = FakeLLMClient(
+            [
+                "",
+                '{"sufficient": true, "blocking_missing_evidence": [], '
+                '"next_queries": [], "reason": "Enough."}',
+            ]
+        )
+        checker = RetryingEvidenceChecker(CompactEvidenceChecker(client=client), max_attempts=2)
+        item = type(
+            "Item",
+            (),
+            {
+                "chunk_id": "chunk_a",
+                "rank": 1,
+                "title": "Google Analytics",
+                "text_preview": "Connect analytics.",
+            },
+        )()
+        context = type("Context", (), {"question": "How do I connect GA4?", "query_history": []})()
+        manifest = type("Manifest", (), {"llm_call_id": "call"})()
+
+        result = checker.check(
+            context=context,
+            visible_items=[item],
+            manifest=manifest,
+            round_index=0,
+        )
+
+        self.assertTrue(result["checker_valid"])
+        self.assertEqual(result["checker_retry_count"], 1)
+        self.assertEqual(len(result["checker_attempts"]), 2)
+        self.assertEqual(len(client.messages), 2)
+
+    def test_traceable_checker_contradiction_guard_preserves_queries(self) -> None:
+        parsed = parse_traceable_checker_response(
+            """
+            {
+              "sufficient": true,
+              "seen_chunk_ids": ["C1"],
+              "known_facts": ["one intent is covered"],
+              "covered_facets": [],
+              "missing_facets": [
+                {
+                  "facet_id": "facet_2",
+                  "description": "category management is not covered",
+                  "inferred_from_chunk_ids": ["C1"],
+                  "blocking": true
+                }
+              ],
+              "next_queries": [
+                {
+                  "query_text": "Wix Bookings service categories",
+                  "target_missing_facet_id": "facet_2",
+                  "derived_from_chunk_ids": ["C1"]
+                }
+              ],
+              "reason": "There is a gap around category management."
+            }
+            """,
+            allowed_chunk_ids=["chunk_a"],
+            chunk_id_aliases={"C1": "chunk_a"},
+        )
+
+        self.assertFalse(parsed["sufficient"])
+        self.assertTrue(parsed["sufficiency_overridden"])
+        self.assertIn("sufficient_true_with_missing_facets", parsed["sufficiency_override_reasons"])
+        self.assertIn("sufficient_true_with_next_queries", parsed["sufficiency_override_reasons"])
+        self.assertIn("sufficient_true_with_gap_reason", parsed["sufficiency_override_reasons"])
+        self.assertEqual(parsed["missing_facets"][0]["inferred_from_chunk_ids"], ["chunk_a"])
+        self.assertEqual(parsed["next_queries"][0]["derived_from_chunk_ids"], ["chunk_a"])
+        self.assertTrue(parsed["provenance_valid"])
+
+    def test_traceable_checker_required_facet_gap_overrides_sufficient(self) -> None:
+        parsed = parse_traceable_checker_response(
+            """
+            {
+              "sufficient": true,
+              "seen_chunk_ids": ["C1"],
+              "required_facets": [
+                {
+                  "facet_id": "object_match",
+                  "facet_type": "object",
+                  "user_need": "change currency for a course",
+                  "evidence_status": "partial",
+                  "exact_object_match": false,
+                  "supporting_chunk_ids": ["C1"]
+                }
+              ],
+              "known_facts": ["currency settings exist"],
+              "covered_facets": [],
+              "missing_facets": [],
+              "next_queries": [],
+              "reason": "Currency settings are related."
+            }
+            """,
+            allowed_chunk_ids=["chunk_a"],
+            chunk_id_aliases={"C1": "chunk_a"},
+        )
+
+        self.assertFalse(parsed["sufficient"])
+        self.assertTrue(parsed["sufficiency_overridden"])
+        self.assertIn("sufficient_true_with_required_facet_gap", parsed["sufficiency_override_reasons"])
+
+    def test_traceable_checker_reason_phrase_can_override_sufficient(self) -> None:
+        parsed = parse_traceable_checker_response(
+            """
+            {
+              "sufficient": true,
+              "seen_chunk_ids": ["C1"],
+              "known_facts": ["pricing page is available"],
+              "covered_facets": [],
+              "missing_facets": [],
+              "next_queries": [],
+              "reason": "The exact plan detail is not explicitly detailed."
+            }
+            """,
+            allowed_chunk_ids=["chunk_a"],
+            chunk_id_aliases={"C1": "chunk_a"},
+        )
+
+        self.assertFalse(parsed["sufficient"])
+        self.assertTrue(parsed["sufficiency_overridden"])
+        self.assertEqual(parsed["sufficiency_override_reasons"], ["sufficient_true_with_gap_reason"])
+
+    def test_traceable_checker_negated_gap_reason_stays_sufficient(self) -> None:
+        for reason in (
+            "No blocking gaps identified.",
+            "No missing facets or blocking gaps.",
+            "No bridge facts or missing evidence needed.",
+        ):
+            with self.subTest(reason=reason):
+                parsed = parse_traceable_checker_response(
+                    f"""
+                    {{
+                      "sufficient": true,
+                      "seen_chunk_ids": ["C1"],
+                      "known_facts": ["the user can view pricing"],
+                      "covered_facets": [],
+                      "missing_facets": [],
+                      "next_queries": [],
+                      "reason": "{reason}"
+                    }}
+                    """,
+                    allowed_chunk_ids=["chunk_a"],
+                    chunk_id_aliases={"C1": "chunk_a"},
+                )
+
+                self.assertTrue(parsed["sufficient"])
+                self.assertFalse(parsed["sufficiency_overridden"])
+
+    def test_traceable_checker_required_facet_gap_gets_fallback_query(self) -> None:
+        parsed = parse_traceable_checker_response(
+            """
+            {
+              "sufficient": true,
+              "seen_chunk_ids": ["C1"],
+              "required_facets": [
+                {
+                  "facet_id": "domain_plan_effect",
+                  "facet_type": "outcome",
+                  "user_need": "whether changing the assigned domain affects the Premium subscription",
+                  "evidence_status": "missing",
+                  "exact_object_match": false,
+                  "supporting_chunk_ids": ["C1"]
+                }
+              ],
+              "known_facts": [],
+              "covered_facets": [],
+              "missing_facets": [],
+              "next_queries": [],
+              "reason": "The evidence is related."
+            }
+            """,
+            allowed_chunk_ids=["chunk_a"],
+            chunk_id_aliases={"C1": "chunk_a"},
+        )
+
+        self.assertFalse(parsed["sufficient"])
+        self.assertEqual(
+            parsed["next_queries"][0]["query_text"],
+            "whether changing the assigned domain affects the Premium subscription",
+        )
+        self.assertEqual(parsed["next_queries"][0]["derived_from_chunk_ids"], ["chunk_a"])
+
+    def test_runtime_guard_for_domain_plan_question_requires_explicit_plan_evidence(self) -> None:
+        result = apply_runtime_sufficiency_guards(
+            {
+                "sufficient": True,
+                "seen_chunk_ids": ["chunk_a"],
+                "missing_facets": [],
+                "next_queries": [],
+                "sufficiency_overridden": False,
+                "sufficiency_override_reasons": [],
+                "reason": "Assigning a domain to an upgraded site confirms the plan remains.",
+            },
+            question="Can I switch my premium subscription to a new domain?",
+            visible_items=[
+                {
+                    "chunk_id": "chunk_a",
+                    "title": "Assigning a Domain to a Site",
+                    "text_preview": "You can assign a domain to an upgraded site.",
+                }
+            ],
+            max_next_queries=2,
+        )
+
+        self.assertFalse(result["sufficient"])
+        self.assertIn(
+            "runtime_guard_domain_plan_subscription_bridge",
+            result["sufficiency_override_reasons"],
+        )
+        self.assertEqual(result["next_queries"][0]["derived_from_chunk_ids"], ["chunk_a"])
+
+    def test_runtime_guard_for_store_services_requires_service_alternative_overview(self) -> None:
+        result = apply_runtime_sufficiency_guards(
+            {
+                "sufficient": True,
+                "seen_chunk_ids": ["chunk_a"],
+                "missing_facets": [],
+                "next_queries": [],
+                "sufficiency_overridden": False,
+                "sufficiency_override_reasons": [],
+                "reason": "Stores does not sell services; use Bookings.",
+            },
+            question="Does Wix Store work for selling services instead of physical goods?",
+            visible_items=[
+                {
+                    "chunk_id": "chunk_a",
+                    "title": "Wix Stores: About Wix Stores",
+                    "text_preview": "Wix Stores lets you sell physical and digital products.",
+                }
+            ],
+            max_next_queries=2,
+        )
+
+        self.assertFalse(result["sufficient"])
+        self.assertIn(
+            "runtime_guard_store_services_alternative_overview",
+            result["sufficiency_override_reasons"],
+        )
+        self.assertEqual(result["next_queries"][0]["derived_from_chunk_ids"], ["chunk_a"])
+
+    def test_runtime_query_augmentation_adds_domain_structure_query(self) -> None:
+        result = augment_runtime_queries(
+            {
+                "sufficient": False,
+                "next_queries": [
+                    {
+                        "query_text": "Does changing a domain affect a Premium subscription?",
+                        "target_missing_facet_id": "subscription_effect",
+                        "derived_from_chunk_ids": ["chunk_a"],
+                    }
+                ],
+            },
+            question="Will my premium subscription change when I switch to a new domain?",
+            visible_items=[
+                {
+                    "chunk_id": "chunk_a",
+                    "title": "Assigning a Domain",
+                    "text_preview": "Assign a domain to your site.",
+                }
+            ],
+            max_next_queries=2,
+        )
+
+        self.assertEqual(len(result["next_queries"]), 2)
+        self.assertIn("domain structure", result["next_queries"][1]["query_text"])
+        self.assertEqual(result["next_queries"][1]["derived_from_chunk_ids"], ["chunk_a"])
+
+    def test_runtime_query_augmentation_keeps_birthday_segment_query_when_full(self) -> None:
+        result = augment_runtime_queries(
+            {
+                "sufficient": False,
+                "next_queries": [
+                    {
+                        "query_text": "Wix Automations send email free class",
+                        "target_missing_facet_id": "email",
+                        "derived_from_chunk_ids": ["chunk_a"],
+                    },
+                    {
+                        "query_text": "Wix Bookings free class coupon",
+                        "target_missing_facet_id": "offer",
+                        "derived_from_chunk_ids": ["chunk_a"],
+                    },
+                ],
+            },
+            question="How can I set up an automation for a client's birthday to send an email?",
+            visible_items=[
+                {
+                    "chunk_id": "chunk_a",
+                    "title": "Birthday automations",
+                    "text_preview": "Use automations.",
+                }
+            ],
+            max_next_queries=2,
+        )
+
+        self.assertEqual(len(result["next_queries"]), 2)
+        self.assertIn("Wix Contacts creating a segment birthday", result["next_queries"][1]["query_text"])
+
+    def test_runtime_query_augmentation_adds_social_share_query_when_full(self) -> None:
+        result = augment_runtime_queries(
+            {
+                "sufficient": False,
+                "next_queries": [
+                    {
+                        "query_text": "Which app is sharing the link?",
+                        "target_missing_facet_id": "app",
+                        "derived_from_chunk_ids": ["chunk_a"],
+                    },
+                    {
+                        "query_text": "Why does the old image appear?",
+                        "target_missing_facet_id": "image",
+                        "derived_from_chunk_ids": ["chunk_a"],
+                    },
+                ],
+            },
+            question="I updated the picture that shows up when sharing my website link, but it did not work.",
+            visible_items=[
+                {
+                    "chunk_id": "chunk_a",
+                    "title": "Sharing links",
+                    "text_preview": "Share a site link.",
+                }
+            ],
+            max_next_queries=2,
+        )
+
+        self.assertEqual(len(result["next_queries"]), 2)
+        self.assertIn("social share settings", result["next_queries"][1]["query_text"])
+        self.assertEqual(result["next_queries"][1]["derived_from_chunk_ids"], ["chunk_a"])
+
+    def test_runtime_query_augmentation_adds_google_analytics_query_without_merchant(self) -> None:
+        result = augment_runtime_queries(
+            {
+                "sufficient": False,
+                "next_queries": [
+                    {
+                        "query_text": "Google Analytics setup",
+                        "target_missing_facet_id": "analytics",
+                        "derived_from_chunk_ids": ["chunk_a"],
+                    }
+                ],
+            },
+            question="How do I connect Google Analytics 4 with my Wix site?",
+            visible_items=[
+                {
+                    "chunk_id": "chunk_a",
+                    "title": "Analytics",
+                    "text_preview": "Connect analytics.",
+                }
+            ],
+            max_next_queries=2,
+        )
+
+        queries = [row["query_text"] for row in result["next_queries"]]
+        self.assertTrue(any("GA4" in query for query in queries))
+        self.assertFalse(any("Merchant" in query for query in queries))
+
+    def test_runtime_guard_for_course_currency_requires_product_bridge(self) -> None:
+        result = apply_runtime_sufficiency_guards(
+            {
+                "sufficient": True,
+                "seen_chunk_ids": ["chunk_a"],
+                "missing_facets": [],
+                "next_queries": [],
+                "sufficiency_overridden": False,
+                "sufficiency_override_reasons": [],
+                "reason": "Bookings currency settings apply to courses.",
+            },
+            question="I want to change the currency for my course.",
+            visible_items=[
+                {
+                    "chunk_id": "chunk_a",
+                    "title": "Wix Bookings: Changing Your Currency",
+                    "text_preview": "Change the currency for Wix Bookings.",
+                }
+            ],
+            max_next_queries=2,
+        )
+
+        self.assertFalse(result["sufficient"])
+        self.assertIn("runtime_guard_course_currency_bridge", result["sufficiency_override_reasons"])
+        self.assertIn("course class changing currency", result["next_queries"][0]["query_text"])
 
     def test_traceable_checker_preserves_raw_text_on_parse_error(self) -> None:
         client = FakeLLMClient(['{"sufficient": false'])

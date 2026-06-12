@@ -28,6 +28,10 @@ def preview_text(value: Any, limit: int = 300) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
+def contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
 def stable_id(prefix: str, index: int) -> str:
     return f"{prefix}_{index:06d}"
 
@@ -58,4 +62,3 @@ def to_string_list(value: Any) -> list[str]:
                 output.append(text)
         return output
     return [clean_text(value)] if clean_text(value) else []
-

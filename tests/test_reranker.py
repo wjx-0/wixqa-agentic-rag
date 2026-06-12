@@ -16,6 +16,7 @@ from src.evaluation.run_rerank_eval import (
     validate_candidates,
 )
 from src.rerankers.cross_encoder_reranker import CrossEncoderReranker
+from src.rerankers.dashscope_reranker import DashScopeReranker
 from src.utils.io_utils import write_json, write_jsonl
 
 
@@ -71,6 +72,17 @@ class FakeReranker:
         return results
 
 
+class FakeDashScopeReranker(DashScopeReranker):
+    def __init__(self, response):
+        self.requests = []
+        self.response = response
+        super().__init__(api_key="fake-key")
+
+    def _post_rerank(self, payload):
+        self.requests.append(payload)
+        return self.response
+
+
 class CrossEncoderRerankerTest(unittest.TestCase):
     def test_reranks_by_score_then_hybrid_rank_then_chunk_id(self) -> None:
         model = FakeModel([0.1, 0.9, 0.9, 0.9])
@@ -98,6 +110,41 @@ class CrossEncoderRerankerTest(unittest.TestCase):
         self.assertEqual([row["rank"] for row in ranked], [1, 2, 3, 4])
         self.assertEqual(ranked[0]["hybrid_rank"], 2)
         self.assertEqual(model.calls[0][1]["prompt_name"], "query")
+
+    def test_dashscope_reranker_maps_scores_by_response_index(self) -> None:
+        lookup = {
+            "a": chunk("a", "article_a"),
+            "b": chunk("b", "article_b"),
+            "c": chunk("c", "article_c"),
+        }
+        reranker = FakeDashScopeReranker(
+            {
+                "model": "qwen3-rerank",
+                "results": [
+                    {"index": 2, "relevance_score": 0.8},
+                    {"index": 0, "relevance_score": 0.3},
+                    {"index": 1, "relevance_score": 0.9},
+                ],
+            }
+        )
+
+        ranked = reranker.rerank(
+            "query text",
+            [
+                candidate("a", "article_a", 1),
+                candidate("b", "article_b", 2),
+                candidate("c", "article_c", 3),
+            ],
+            lookup,
+            batch_size=3,
+        )
+
+        self.assertEqual([row["chunk_id"] for row in ranked], ["b", "c", "a"])
+        self.assertEqual([row["rerank_score"] for row in ranked], [0.9, 0.8, 0.3])
+        self.assertEqual(reranker.requests[0]["model"], "qwen3-rerank")
+        self.assertEqual(reranker.requests[0]["query"], "query text")
+        self.assertEqual(reranker.requests[0]["top_n"], 3)
+        self.assertEqual(len(reranker.requests[0]["documents"]), 3)
 
     def test_diagnostics_track_rescued_and_dropped_gold_articles(self) -> None:
         before = [

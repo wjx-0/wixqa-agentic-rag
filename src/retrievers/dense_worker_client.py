@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ class DenseWorkerClient:
         self.process: subprocess.Popen[str] | None = None
         self.store: FaissVectorStore | None = None
         self.request_id = 0
+        self._lock = threading.RLock()
 
     def __enter__(self) -> DenseWorkerClient:
         self.start()
@@ -48,61 +50,62 @@ class DenseWorkerClient:
         self.close()
 
     def start(self) -> None:
-        if self.process is not None:
-            return
-        if self.mode == "model_only":
-            self.store = FaissVectorStore(
-                self.index_dir / "faiss.index",
-                self.index_dir / "chunk_metadata.jsonl",
-            )
+        with self._lock:
+            if self.process is not None:
+                return
+            if self.mode == "model_only":
+                self.store = FaissVectorStore(
+                    self.index_dir / "faiss.index",
+                    self.index_dir / "chunk_metadata.jsonl",
+                )
 
-        root = Path(__file__).resolve().parents[2]
-        env = os.environ.copy()
-        hf_home = Path("/root/rivermind-data/models/huggingface")
-        if hf_home.exists():
-            env["HF_HOME"] = str(hf_home)
-            env["HUGGINGFACE_HUB_CACHE"] = str(hf_home / "hub")
-            env["TRANSFORMERS_CACHE"] = str(hf_home / "hub")
-        python_path = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = str(root) if not python_path else f"{root}{os.pathsep}{python_path}"
-        if self.local_files_only:
-            env.setdefault("HF_HUB_OFFLINE", "1")
-            env.setdefault("TRANSFORMERS_OFFLINE", "1")
+            root = Path(__file__).resolve().parents[2]
+            env = os.environ.copy()
+            hf_home = Path("/root/rivermind-data/models/huggingface")
+            if hf_home.exists():
+                env["HF_HOME"] = str(hf_home)
+                env["HUGGINGFACE_HUB_CACHE"] = str(hf_home / "hub")
+                env["TRANSFORMERS_CACHE"] = str(hf_home / "hub")
+            python_path = env.get("PYTHONPATH")
+            env["PYTHONPATH"] = str(root) if not python_path else f"{root}{os.pathsep}{python_path}"
+            if self.local_files_only:
+                env.setdefault("HF_HUB_OFFLINE", "1")
+                env.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-        command = [
-            sys.executable,
-            "-m",
-            "src.retrievers.dense_worker",
-            "--index_dir",
-            str(self.index_dir),
-            "--model_name",
-            self.model_name,
-            "--local_files_only",
-            "true" if self.local_files_only else "false",
-            "--mode",
-            self.mode,
-        ]
-        if self.device:
-            command.extend(["--device", self.device])
-        self.process = subprocess.Popen(
-            command,
-            cwd=root,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        try:
-            message = self._read_message("while starting")
-        except Exception:
-            self.close()
-            raise
-        if message.get("type") != "ready":
-            self.close()
-            raise DenseWorkerClientError(
-                f"Dense worker returned an unexpected startup message: {message!r}"
+            command = [
+                sys.executable,
+                "-m",
+                "src.retrievers.dense_worker",
+                "--index_dir",
+                str(self.index_dir),
+                "--model_name",
+                self.model_name,
+                "--local_files_only",
+                "true" if self.local_files_only else "false",
+                "--mode",
+                self.mode,
+            ]
+            if self.device:
+                command.extend(["--device", self.device])
+            self.process = subprocess.Popen(
+                command,
+                cwd=root,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+                bufsize=1,
             )
+            try:
+                message = self._read_message("while starting")
+            except Exception:
+                self.close()
+                raise
+            if message.get("type") != "ready":
+                self.close()
+                raise DenseWorkerClientError(
+                    f"Dense worker returned an unexpected startup message: {message!r}"
+                )
 
     def search(
         self,
@@ -115,57 +118,59 @@ class DenseWorkerClient:
             raise DenseWorkerClientError("top_k_chunks must be a positive integer.")
         if query_batch_size <= 0:
             raise DenseWorkerClientError("query_batch_size must be a positive integer.")
-        self.start()
+        with self._lock:
+            self.start()
 
-        all_results: list[list[dict[str, Any]]] = []
-        for start in range(0, len(queries), query_batch_size):
-            query_batch = queries[start : start + query_batch_size]
-            self.request_id += 1
-            self._write_message(
-                {
-                    "type": "search",
-                    "request_id": self.request_id,
-                    "queries": query_batch,
-                    "top_k_chunks": top_k_chunks,
-                    "batch_size": query_batch_size,
-                }
-            )
-            message = self._read_message("while searching")
-            if message.get("type") == "error":
-                raise DenseWorkerClientError(f"Dense worker search failed: {message.get('message')}")
-            if message.get("type") != "search_result":
-                raise DenseWorkerClientError(
-                    f"Dense worker returned an unexpected search message: {message!r}"
+            all_results: list[list[dict[str, Any]]] = []
+            for start in range(0, len(queries), query_batch_size):
+                query_batch = queries[start : start + query_batch_size]
+                self.request_id += 1
+                self._write_message(
+                    {
+                        "type": "search",
+                        "request_id": self.request_id,
+                        "queries": query_batch,
+                        "top_k_chunks": top_k_chunks,
+                        "batch_size": query_batch_size,
+                    }
                 )
-            if message.get("request_id") != self.request_id:
-                raise DenseWorkerClientError(
-                    "Dense worker response request_id does not match the current request."
-                )
-            all_results.extend(self._decode_results(message, top_k_chunks=top_k_chunks))
-        return all_results
+                message = self._read_message("while searching")
+                if message.get("type") == "error":
+                    raise DenseWorkerClientError(f"Dense worker search failed: {message.get('message')}")
+                if message.get("type") != "search_result":
+                    raise DenseWorkerClientError(
+                        f"Dense worker returned an unexpected search message: {message!r}"
+                    )
+                if message.get("request_id") != self.request_id:
+                    raise DenseWorkerClientError(
+                        "Dense worker response request_id does not match the current request."
+                    )
+                all_results.extend(self._decode_results(message, top_k_chunks=top_k_chunks))
+            return all_results
 
     def close(self) -> None:
-        process = self.process
-        self.process = None
-        if process is None:
-            return
-        if process.poll() is None:
-            try:
-                if process.stdin is not None:
-                    process.stdin.write('{"type":"close"}\n')
-                    process.stdin.flush()
-                process.wait(timeout=5)
-            except (BrokenPipeError, subprocess.TimeoutExpired):
-                process.terminate()
+        with self._lock:
+            process = self.process
+            self.process = None
+            if process is None:
+                return
+            if process.poll() is None:
                 try:
+                    if process.stdin is not None:
+                        process.stdin.write('{"type":"close"}\n')
+                        process.stdin.flush()
                     process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-        if process.stdin is not None:
-            process.stdin.close()
-        if process.stdout is not None:
-            process.stdout.close()
+                except (BrokenPipeError, subprocess.TimeoutExpired):
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            if process.stdin is not None:
+                process.stdin.close()
+            if process.stdout is not None:
+                process.stdout.close()
 
     def _decode_results(
         self,

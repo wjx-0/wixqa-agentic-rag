@@ -37,6 +37,7 @@ from src.llm.evidence_checker import (
 from src.retrievers.dense_faiss_retriever import DEFAULT_DENSE_MODEL_NAME
 from src.retrievers.dense_worker_client import VALID_WORKER_MODES
 from src.retrievers.rrf import DEFAULT_BM25_WEIGHT
+from src.utils.env_utils import load_project_env
 
 
 def parse_bool(value: str | bool) -> bool:
@@ -51,6 +52,7 @@ def parse_bool(value: str | bool) -> bool:
 
 
 def main() -> int:
+    load_project_env(ROOT)
     parser = argparse.ArgumentParser(
         description="Run LLM evidence sufficiency checker pool-level evaluation."
     )

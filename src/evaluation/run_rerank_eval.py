@@ -34,6 +34,7 @@ from src.rerankers.cross_encoder_reranker import (
     CrossEncoderRerankerError,
 )
 from src.utils.io_utils import ensure_dir, read_json, read_jsonl, write_json, write_jsonl
+from src.utils.metrics import average
 
 
 SUPPORTED_CANDIDATE_CUTOFFS = {50, 100}
@@ -560,10 +561,3 @@ def slug(value: str, *, allow_underscore: bool = False) -> str:
     normalized = value.strip().lower().replace(".", "p")
     pattern = r"[^a-z0-9_-]+" if allow_underscore else r"[^a-z0-9-]+"
     return re.sub(pattern, "-", normalized).strip("-")
-
-
-def average(values: Any) -> float:
-    value_list = list(values)
-    if not value_list:
-        return 0.0
-    return sum(float(value) for value in value_list) / len(value_list)

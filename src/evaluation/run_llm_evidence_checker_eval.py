@@ -33,7 +33,6 @@ from src.evaluation.run_rule_second_hop_eval import (
     DEFAULT_RRF_K,
     DEFAULT_SECOND_HOP_TOP_K_CHUNKS,
     RuleSecondHopEvalError,
-    average,
     count_true,
     load_json_object,
     load_optional_top100_control,
@@ -42,6 +41,7 @@ from src.evaluation.run_rule_second_hop_eval import (
     run_second_hop_retrieval,
     validate_candidate_cutoff,
 )
+from src.utils.metrics import average
 from src.llm.evidence_checker import (
     DEFAULT_CHECKER_MAX_TOKENS,
     DEFAULT_CHECKER_TEMPERATURE,
@@ -56,6 +56,7 @@ from src.llm.evidence_checker import (
 from src.retrievers.dense_faiss_retriever import DEFAULT_DENSE_MODEL_NAME
 from src.retrievers.rrf import DEFAULT_BM25_WEIGHT
 from src.retrievers.rule_second_hop import RuleSecondHopError, merge_chunk_candidates
+from src.utils.env_utils import deepseek_base_url_from_env
 from src.utils.io_utils import ensure_dir, write_json, write_jsonl
 from src.utils.text_utils import compact_text
 
@@ -365,9 +366,25 @@ def resolve_llm_config(
     checker_client: Any | None,
 ) -> dict[str, str]:
     model_from_client = compact_text(getattr(checker_client, "model", "")) if checker_client else ""
-    base_url = first_text(llm_base_url, os.environ.get("LLM_BASE_URL"), os.environ.get("OPENAI_BASE_URL"))
-    api_key = first_text(llm_api_key, os.environ.get("LLM_API_KEY"), os.environ.get("OPENAI_API_KEY"))
-    model = first_text(llm_model, os.environ.get("LLM_MODEL"), os.environ.get("OPENAI_MODEL"), model_from_client)
+    base_url = first_text(
+        llm_base_url,
+        os.environ.get("LLM_BASE_URL"),
+        os.environ.get("OPENAI_BASE_URL"),
+        deepseek_base_url_from_env(),
+    )
+    api_key = first_text(
+        llm_api_key,
+        os.environ.get("LLM_API_KEY"),
+        os.environ.get("OPENAI_API_KEY"),
+        os.environ.get("DEEPSEEK_API_KEY"),
+    )
+    model = first_text(
+        llm_model,
+        os.environ.get("LLM_MODEL"),
+        os.environ.get("OPENAI_MODEL"),
+        os.environ.get("DEEPSEEK_MODEL"),
+        model_from_client,
+    )
     if checker_client is None:
         if not base_url:
             raise LLMEvidenceCheckerEvalError(

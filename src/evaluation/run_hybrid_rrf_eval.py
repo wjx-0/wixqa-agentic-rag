@@ -33,6 +33,7 @@ from src.retrievers.dense_faiss_retriever import DEFAULT_DENSE_MODEL_NAME
 from src.retrievers.hybrid_retriever import HybridRetriever, HybridRetrieverError
 from src.retrievers.rrf import DEFAULT_BM25_WEIGHT, DEFAULT_DENSE_WEIGHT
 from src.utils.io_utils import ensure_dir, write_json, write_jsonl
+from src.utils.metrics import average
 
 
 class HybridRRFEvalError(RuntimeError):
@@ -572,13 +573,6 @@ def print_summary(console: Console, summary: dict[str, Any], output_dir: Path) -
     )
     console.print()
     console.print(f"Results saved to {output_dir}/")
-
-
-def average(values: Any) -> float:
-    value_list = list(values)
-    if not value_list:
-        return 0.0
-    return sum(float(value) for value in value_list) / len(value_list)
 
 
 def weight_slug(weight: float) -> str:
